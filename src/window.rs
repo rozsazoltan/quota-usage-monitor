@@ -3865,7 +3865,7 @@ fn render_layered() {
     let copilot_accent = custom_color(appearance.copilot_accent, copilot_accent_color());
 
     unsafe {
-        let screen_dc = GetDC(hwnd);
+        let screen_dc = GetDC(HWND::default());
 
         let bmi = BITMAPINFO {
             bmiHeader: BITMAPINFOHEADER {
@@ -3887,7 +3887,7 @@ fn render_layered() {
 
         if dib.is_invalid() || bits.is_null() {
             let _ = DeleteDC(mem_dc);
-            ReleaseDC(hwnd, screen_dc);
+            ReleaseDC(HWND::default(), screen_dc);
             return;
         }
 
@@ -4032,7 +4032,7 @@ fn render_layered() {
         SelectObject(mem_dc, old_bmp);
         let _ = DeleteObject(dib);
         let _ = DeleteDC(mem_dc);
-        ReleaseDC(hwnd, screen_dc);
+        ReleaseDC(HWND::default(), screen_dc);
     }
 }
 
