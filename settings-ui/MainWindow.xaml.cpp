@@ -1414,6 +1414,9 @@ namespace winrt::SettingsUI::implementation
     }
     void MainWindow::Action(std::wstring const& action)
     {
+#if QUOTA_DEVELOPMENT_UI
+        if (action == L"update" && updateSimulationEnabled_) return;
+#endif
         if (previewTimer_) previewTimer_.Stop();
         previewPending_ = false;
         deferredAction_ = action;
@@ -1682,13 +1685,28 @@ namespace winrt::SettingsUI::implementation
                 state_ ? NativeLocalization::Translate(L"Version", g_nativeLanguage) + L" " + version : NativeLocalization::Translate(L"Connecting to the widget…", g_nativeLanguage));
         }
         if (updateStatusText_ && page_ == L"Update")
-            updateStatusText_.Text(state_ ? NativeLocalization::Translate(std::wstring(state_.GetNamedString(L"update_status", L"Update status unavailable").c_str()), g_nativeLanguage) : NativeLocalization::Translate(L"Checking update status…", g_nativeLanguage));
+        {
+#if QUOTA_DEVELOPMENT_UI
+            if (updateSimulationEnabled_)
+            {
+                const auto installed = state_ ? std::wstring(state_.GetNamedString(L"version", L"unknown").c_str()) : std::wstring(L"…");
+                updateStatusText_.Text(L"v" + installed + L" - Update to v9999.99.9 (simulated)");
+            }
+            else
+#endif
+                updateStatusText_.Text(state_ ? NativeLocalization::Translate(std::wstring(state_.GetNamedString(L"update_status", L"Update status unavailable").c_str()), g_nativeLanguage) : NativeLocalization::Translate(L"Checking update status…", g_nativeLanguage));
+        }
         UpdateUpdateIndicator();
         if (checkForUpdatesButton_)
         {
             const bool busy = state_ && state_.GetNamedBoolean(L"update_busy", false);
-            const bool available = state_ && state_.GetNamedBoolean(L"update_available", false);
-            checkForUpdatesButton_.IsEnabled(!busy);
+#if QUOTA_DEVELOPMENT_UI
+            const bool simulated = updateSimulationEnabled_;
+#else
+            const bool simulated = false;
+#endif
+            const bool available = simulated || (state_ && state_.GetNamedBoolean(L"update_available", false));
+            checkForUpdatesButton_.IsEnabled(!busy && !simulated);
             checkForUpdatesButton_.Content(box_value(NativeLocalization::Translate(busy ? L"Working…" : available ? L"Install update" : L"Check for updates", g_nativeLanguage)));
             Microsoft::UI::Xaml::Automation::AutomationProperties::SetName(checkForUpdatesButton_,
                 NativeLocalization::Translate(busy ? L"Update in progress" : available ? L"Install available update" : L"Check for updates", g_nativeLanguage));
@@ -1703,7 +1721,11 @@ namespace winrt::SettingsUI::implementation
     }
     void MainWindow::UpdateUpdateIndicator()
     {
-        const bool available = state_ && state_.GetNamedBoolean(L"update_available", false);
+        const bool available = state_ && state_.GetNamedBoolean(L"update_available", false)
+#if QUOTA_DEVELOPMENT_UI
+            || updateSimulationEnabled_
+#endif
+            ;
         if (updateIndicator_)
         {
             updateIndicator_.Visibility(available ? Visibility::Visible : Visibility::Collapsed);
@@ -3676,6 +3698,23 @@ namespace winrt::SettingsUI::implementation
         reset.Click([this](auto const&, auto const&) { QueueDevelopmentRequest(Request(L"development_reset")); });
         introContent.Children().Append(reset); intro.Child(introContent); PageHost().Children().Append(intro);
 
+        auto simulateUpdate = ToggleSwitch(); SetSwitchContent(simulateUpdate);
+        simulateUpdate.IsOn(updateSimulationEnabled_);
+        Microsoft::UI::Xaml::Automation::AutomationProperties::SetName(simulateUpdate, L"Simulate available update v9999.99.9");
+        Microsoft::UI::Xaml::Automation::AutomationProperties::SetAutomationId(simulateUpdate, L"Development_simulateUpdate");
+        simulateUpdate.Toggled([this](auto const& sender, auto const&)
+        {
+            updateSimulationEnabled_ = sender.as<ToggleSwitch>().IsOn();
+            UpdateAboutControls();
+            if (page_ == L"Update") RenderPage(page_);
+        });
+        auto updateSimulationCopy = StackPanel();
+        updateSimulationCopy.Children().Append(Label(L"Simulate available update v9999.99.9"));
+        updateSimulationCopy.Children().Append(Label(L"Preview update layout only. No download or installation occurs.", 12));
+        auto updateSimulationCard = Card();
+        updateSimulationCard.Child(ToggleRow(updateSimulationCopy, simulateUpdate));
+        PageHost().Children().Append(updateSimulationCard);
+
         const std::array<std::wstring, 7> ids{ L"claude", L"codex", L"antigravity", L"opencode", L"cursor", L"grok", L"copilot" };
         const auto providers = ProviderAppearanceMeta();
         const auto overrides = state_ ? state_.GetNamedObject(L"development_overrides", JsonObject()) : JsonObject();
@@ -3776,14 +3815,22 @@ namespace winrt::SettingsUI::implementation
         versionText_.Foreground(Application::Current().Resources().Lookup(box_value(L"TextFillColorSecondaryBrush")).as<Media::Brush>());
 
         checkForUpdatesButton_ = Button();
-        const bool updateAvailable = state_ && state_.GetNamedBoolean(L"update_available", false);
+        const bool updateAvailable = state_ && state_.GetNamedBoolean(L"update_available", false)
+#if QUOTA_DEVELOPMENT_UI
+            || updateSimulationEnabled_
+#endif
+            ;
         const bool updateBusy = state_ && state_.GetNamedBoolean(L"update_busy", false);
         checkForUpdatesButton_.Content(box_value(NativeLocalization::Translate(updateBusy ? L"Working…" : updateAvailable ? L"Install update" : L"Check for updates", g_nativeLanguage)));
         Microsoft::UI::Xaml::Automation::AutomationProperties::SetAutomationId(checkForUpdatesButton_, L"CheckForUpdates");
         Microsoft::UI::Xaml::Automation::AutomationProperties::SetName(checkForUpdatesButton_,
             NativeLocalization::Translate(updateBusy ? L"Update in progress" : updateAvailable ? L"Install available update" : L"Check for updates", g_nativeLanguage));
         checkForUpdatesButton_.Style(Application::Current().Resources().Lookup(box_value(L"AccentButtonStyle")).as<Style>());
-        checkForUpdatesButton_.IsEnabled(!updateBusy);
+        checkForUpdatesButton_.IsEnabled(!updateBusy
+#if QUOTA_DEVELOPMENT_UI
+            && !updateSimulationEnabled_
+#endif
+            );
         checkForUpdatesButton_.HorizontalAlignment(HorizontalAlignment::Left);
         checkForUpdatesButton_.Click([this](auto const&, auto const&) { Action(L"update"); });
         auto updateActionRow = Grid(); updateActionRow.ColumnSpacing(12);
@@ -3971,9 +4018,30 @@ namespace winrt::SettingsUI::implementation
     {
         auto card = Card();
         auto stack = StackPanel(); stack.Spacing(14);
-        const bool available = state_ && state_.GetNamedBoolean(L"update_available", false);
+        bool available = state_ && state_.GetNamedBoolean(L"update_available", false);
+#if QUOTA_DEVELOPMENT_UI
+        if (updateSimulationEnabled_)
+        {
+            available = true;
+        }
+#endif
         stack.Children().Append(Label(available ? L"A newer version is ready" : L"Check for an update", 21));
+#if QUOTA_DEVELOPMENT_UI
+        if (updateSimulationEnabled_)
+        {
+            auto simulationNotice = Label(L"Simulation only — no download or installation will occur.", 13);
+            simulationNotice.Foreground(Application::Current().Resources().Lookup(box_value(L"TextFillColorSecondaryBrush")).as<Media::Brush>());
+            stack.Children().Append(simulationNotice);
+        }
+#endif
         updateStatusText_ = Label(state_ ? NativeLocalization::Translate(std::wstring(state_.GetNamedString(L"update_status", L"Update status unavailable").c_str()), g_nativeLanguage) : NativeLocalization::Translate(L"Checking update status…", g_nativeLanguage), 14);
+#if QUOTA_DEVELOPMENT_UI
+        if (updateSimulationEnabled_)
+        {
+            const auto installed = state_ ? std::wstring(state_.GetNamedString(L"version", L"unknown").c_str()) : std::wstring(L"…");
+            updateStatusText_.Text(L"v" + installed + L" - Update to v9999.99.9 (simulated)");
+        }
+#endif
         updateStatusText_.TextWrapping(TextWrapping::Wrap);
         stack.Children().Append(updateStatusText_);
         checkForUpdatesButton_ = Button();
@@ -3981,7 +4049,11 @@ namespace winrt::SettingsUI::implementation
         Microsoft::UI::Xaml::Automation::AutomationProperties::SetAutomationId(checkForUpdatesButton_, L"CheckForUpdates");
         Microsoft::UI::Xaml::Automation::AutomationProperties::SetName(checkForUpdatesButton_, NativeLocalization::Translate(available ? L"Install available update" : L"Check for updates", g_nativeLanguage));
         checkForUpdatesButton_.Style(Application::Current().Resources().Lookup(box_value(L"AccentButtonStyle")).as<Style>());
-        checkForUpdatesButton_.IsEnabled(!(state_ && state_.GetNamedBoolean(L"update_busy", false)));
+        checkForUpdatesButton_.IsEnabled(!(state_ && state_.GetNamedBoolean(L"update_busy", false))
+#if QUOTA_DEVELOPMENT_UI
+            && !updateSimulationEnabled_
+#endif
+            );
         checkForUpdatesButton_.HorizontalAlignment(HorizontalAlignment::Left);
         checkForUpdatesButton_.Click([this](auto const&, auto const&) { Action(L"update"); });
         stack.Children().Append(checkForUpdatesButton_);

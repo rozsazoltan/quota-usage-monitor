@@ -130,6 +130,7 @@ namespace winrt::SettingsUI::implementation
         std::queue<winrt::Windows::Data::Json::JsonObject> developmentRequests_;
         bool developmentRequestInFlight_{};
         bool developmentResetInFlight_{};
+        bool updateSimulationEnabled_{};
 #endif
         winrt::Microsoft::UI::Xaml::Controls::GridView providerOrderGrid_{ nullptr };
         winrt::Microsoft::UI::Xaml::Controls::Canvas providerOrderOverlay_{ nullptr };
