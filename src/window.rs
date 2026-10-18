@@ -23,7 +23,7 @@ use crate::localization::{self, LanguageId, Strings};
 use crate::models::AppUsageData;
 use crate::native_interop::{
     self, Color, TIMER_COUNTDOWN, TIMER_FRESHNESS, TIMER_POLL, TIMER_TASKBAR_RETRY,
-    TIMER_UPDATE_CHECK, WM_APP_TRAY, WM_APP_USAGE_UPDATED,
+    TIMER_UPDATE_CHECK, TIMER_WAKE_RECOVERY, WM_APP_TRAY, WM_APP_USAGE_UPDATED,
 };
 use crate::poller;
 use crate::provider_icons::{self, Provider};
@@ -5057,6 +5057,25 @@ fn recover_polling(hwnd: HWND, network: bool) {
     }
 }
 
+/// Retry widget surface recovery after Windows and the shell have resumed.
+/// The immediate power notification can arrive before Explorer/DWM is ready.
+fn recover_wake_surface(hwnd: HWND) {
+    if MONITOR_TRANSITION_IN_PROGRESS.load(Ordering::Acquire) {
+        unsafe {
+            let _ = SetTimer(hwnd, TIMER_WAKE_RECOVERY, 1_000, None);
+        }
+        return;
+    }
+
+    let placement = refresh_monitor_selection(hwnd);
+    if placement.reposition {
+        position_at_taskbar();
+    }
+    let reset = native_interop::reset_layered_surface(hwnd);
+    diagnose::log(format!("wake recovery: layered surface reset={reset}"));
+    render_layered();
+}
+
 /// Main window procedure
 unsafe extern "system" fn wnd_proc(
     hwnd: HWND,
@@ -5159,6 +5178,7 @@ unsafe extern "system" fn wnd_proc(
                 || wparam.0 == PBT_APMRESUMESUSPEND as usize =>
         {
             recover_polling(hwnd, false);
+            let _ = SetTimer(hwnd, TIMER_WAKE_RECOVERY, 2_000, None);
             LRESULT(1)
         }
         _ if msg == recovery_events::MESSAGE => {
@@ -5218,6 +5238,10 @@ unsafe extern "system" fn wnd_proc(
                     if !placement.retry {
                         diagnose::log("monitor target resolved; placement retry timer stopped");
                     }
+                }
+                TIMER_WAKE_RECOVERY => {
+                    let _ = KillTimer(hwnd, TIMER_WAKE_RECOVERY);
+                    recover_wake_surface(hwnd);
                 }
                 TIMER_FRESHNESS => {
                     update_display();
