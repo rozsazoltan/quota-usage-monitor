@@ -3865,8 +3865,6 @@ fn render_layered() {
     let copilot_accent = custom_color(appearance.copilot_accent, copilot_accent_color());
 
     unsafe {
-        let screen_dc = GetDC(HWND::default());
-
         let bmi = BITMAPINFO {
             bmiHeader: BITMAPINFOHEADER {
                 biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
@@ -3881,13 +3879,12 @@ fn render_layered() {
         };
 
         let mut bits: *mut std::ffi::c_void = std::ptr::null_mut();
-        let mem_dc = CreateCompatibleDC(screen_dc);
+        let mem_dc = CreateCompatibleDC(None);
         let dib =
             CreateDIBSection(mem_dc, &bmi, DIB_RGB_COLORS, &mut bits, None, 0).unwrap_or_default();
 
         if dib.is_invalid() || bits.is_null() {
             let _ = DeleteDC(mem_dc);
-            ReleaseDC(HWND::default(), screen_dc);
             return;
         }
 
@@ -3991,7 +3988,7 @@ fn render_layered() {
 
         let rendered = UpdateLayeredWindow(
             hwnd,
-            screen_dc,
+            None,
             None,
             Some(&sz),
             mem_dc,
@@ -4008,7 +4005,7 @@ fn render_layered() {
             let mut recovered = false;
             if native_interop::reset_layered_surface(hwnd) {
                 if let Err(error) = UpdateLayeredWindow(
-                    hwnd, screen_dc, None, Some(&sz), mem_dc, Some(&pt_src),
+                    hwnd, None, None, Some(&sz), mem_dc, Some(&pt_src),
                     COLORREF(0), Some(&blend), ULW_ALPHA,
                 ) {
                     diagnose::log_error("widget layered surface recovery failed", error);
@@ -4032,7 +4029,6 @@ fn render_layered() {
         SelectObject(mem_dc, old_bmp);
         let _ = DeleteObject(dib);
         let _ = DeleteDC(mem_dc);
-        ReleaseDC(HWND::default(), screen_dc);
     }
 }
 
