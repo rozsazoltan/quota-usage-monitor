@@ -1092,6 +1092,11 @@ namespace winrt::SettingsUI::implementation
         if (wasDevelopment && ok)
         {
             ShowMessage(L"Development overrides updated. Saved settings are unchanged.");
+            if (wasDevelopmentReset)
+            {
+                updateSimulationEnabled_ = false;
+                UpdateAboutControls();
+            }
             if (wasDevelopmentReset && page_ == L"Development") RenderPage(page_);
         }
 #endif
@@ -3657,8 +3662,19 @@ namespace winrt::SettingsUI::implementation
             developmentNavigationItem_.Tag(box_value(L"Development"));
             developmentNavigationItem_.Icon(SymbolIcon(Symbol::Repair));
             Microsoft::UI::Xaml::Automation::AutomationProperties::SetAutomationId(developmentNavigationItem_, L"NavigationDevelopment");
-            Navigation().FooterMenuItems().Append(developmentNavigationItem_);
         }
+        auto footerItems = Navigation().FooterMenuItems();
+        bool developmentItemPresent = false;
+        for (uint32_t i = 0; i < footerItems.Size(); ++i)
+        {
+            auto item = footerItems.GetAt(i).try_as<NavigationViewItem>();
+            if (item && item.Tag() && unbox_value<hstring>(item.Tag()) == L"Development")
+            {
+                developmentItemPresent = true;
+                break;
+            }
+        }
+        if (!developmentItemPresent) footerItems.Append(developmentNavigationItem_);
         NavigateTo(L"Development");
     }
 
@@ -3689,14 +3705,48 @@ namespace winrt::SettingsUI::implementation
         PageEyebrow().Text(L"DEBUG BUILD ONLY");
         PageSummary().Text(L"Simulate providers and usage without changing credentials or saved settings.");
         SaveHint().Text(L"Use Apply on each provider. Overrides affect the widget and previews immediately and disappear when the app exits.");
+
+        auto developerActions = Card();
+        auto developerActionsStack = StackPanel(); developerActionsStack.Spacing(12);
+        developerActionsStack.Children().Append(Label(L"Developer settings", 19));
+        developerActionsStack.Children().Append(Label(L"Exit hides this page without changing developer settings. Reset clears provider overrides and update simulation only.", 13));
+        auto developerActionButtons = StackPanel();
+        developerActionButtons.Orientation(Orientation::Horizontal);
+        developerActionButtons.Spacing(8);
+        auto exitDevelopment = Button();
+        exitDevelopment.Content(box_value(L"Exit developer settings"));
+        Microsoft::UI::Xaml::Automation::AutomationProperties::SetName(exitDevelopment, L"Exit developer settings and hide Development page");
+        Microsoft::UI::Xaml::Automation::AutomationProperties::SetAutomationId(exitDevelopment, L"DevelopmentExit");
+        exitDevelopment.Click([this](auto const&, auto const&)
+        {
+            NavigateTo(L"General");
+            auto footerItems = Navigation().FooterMenuItems();
+            for (uint32_t i = 0; i < footerItems.Size(); ++i)
+            {
+                auto item = footerItems.GetAt(i).try_as<NavigationViewItem>();
+                if (item && item.Tag() && unbox_value<hstring>(item.Tag()) == L"Development")
+                {
+                    footerItems.RemoveAt(i);
+                    break;
+                }
+            }
+        });
+        auto resetDeveloperSettings = Button();
+        resetDeveloperSettings.Content(box_value(L"Reset developer settings"));
+        Microsoft::UI::Xaml::Automation::AutomationProperties::SetName(resetDeveloperSettings, L"Reset all developer settings to defaults");
+        Microsoft::UI::Xaml::Automation::AutomationProperties::SetAutomationId(resetDeveloperSettings, L"DevelopmentReset");
+        resetDeveloperSettings.Click([this](auto const&, auto const&) { QueueDevelopmentRequest(Request(L"development_reset")); });
+        developerActionButtons.Children().Append(exitDevelopment);
+        developerActionButtons.Children().Append(resetDeveloperSettings);
+        developerActionsStack.Children().Append(developerActionButtons);
+        developerActions.Child(developerActionsStack);
+        PageHost().Children().Append(developerActions);
+
         auto intro = Card();
         auto introContent = StackPanel(); introContent.Spacing(12);
         introContent.Children().Append(Label(L"Temporary development overrides", 19));
         introContent.Children().Append(Label(L"Force enable bypasses local provider detection and the provider count limit. Blank percentages keep the live quota value. Values are used percentages, from 0 to 100.", 13));
-        auto reset = Button(); reset.Content(box_value(L"Reset all overrides"));
-        Microsoft::UI::Xaml::Automation::AutomationProperties::SetAutomationId(reset, L"DevelopmentReset");
-        reset.Click([this](auto const&, auto const&) { QueueDevelopmentRequest(Request(L"development_reset")); });
-        introContent.Children().Append(reset); intro.Child(introContent); PageHost().Children().Append(intro);
+        intro.Child(introContent); PageHost().Children().Append(intro);
 
         auto simulateUpdate = ToggleSwitch(); SetSwitchContent(simulateUpdate);
         simulateUpdate.IsOn(updateSimulationEnabled_);
