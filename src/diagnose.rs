@@ -12,10 +12,16 @@ static DIAGNOSE_STATE: OnceLock<DiagnoseState> = OnceLock::new();
 
 pub fn init() -> Result<PathBuf, String> {
     let path = std::env::temp_dir().join("quota-usage.log");
-    let file = OpenOptions::new()
-        .create(true)
-        .write(true)
-        .truncate(true)
+    let relaunched = std::env::var_os("QUOTA_USAGE_RELAUNCH").is_some()
+        || std::env::var_os("CODEX_USAGE_RELAUNCH").is_some();
+    let mut options = OpenOptions::new();
+    options.create(true).write(true);
+    if relaunched {
+        options.append(true);
+    } else {
+        options.truncate(true);
+    }
+    let file = options
         .open(&path)
         .map_err(|e| format!("Unable to open diagnostic log file {}: {e}", path.display()))?;
 
@@ -23,7 +29,7 @@ pub fn init() -> Result<PathBuf, String> {
         file: Mutex::new(file),
     });
 
-    log("diagnostic logging enabled");
+    log(format!("diagnostic logging enabled; relaunched={relaunched}"));
     Ok(path)
 }
 

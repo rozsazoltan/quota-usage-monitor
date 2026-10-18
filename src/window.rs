@@ -23,7 +23,7 @@ use crate::localization::{self, LanguageId, Strings};
 use crate::models::AppUsageData;
 use crate::native_interop::{
     self, Color, TIMER_COUNTDOWN, TIMER_FRESHNESS, TIMER_POLL, TIMER_TASKBAR_RETRY,
-    TIMER_UPDATE_CHECK, WM_APP_TRAY, WM_APP_USAGE_UPDATED,
+    TIMER_UPDATE_CHECK, TIMER_WAKE_RECOVERY, WM_APP_TRAY, WM_APP_USAGE_UPDATED,
 };
 use crate::poller;
 use crate::provider_icons::{self, Provider};
@@ -228,6 +228,7 @@ const IDM_APPEARANCE_PAGE: u16 = 107;
 const WM_DPICHANGED_MSG: u32 = 0x02E0;
 const WM_APP_UPDATE_CHECK_COMPLETE: u32 = WM_APP + 2;
 const WM_APP_TASKBAR_CREATED: u32 = WM_APP + 4;
+const WATCHDOG_TASKBAR_REFRESH_WPARAM: usize = 1;
 const WM_APP_MONITOR_REFRESH: u32 = WM_APP + 5;
 const TRAY_ICON_UPDATE_REPOSITION_SUPPRESS_MS: u64 = 750;
 
@@ -246,33 +247,23 @@ static PENDING_TASKBAR_REFRESH: AtomicBool = AtomicBool::new(false);
 /// repeated mismatch triggers a refresh, because ripping a healthy child out
 /// of the taskbar over one transient can poison the surface.
 static WATCHDOG_STALE_SIGHTINGS: AtomicU32 = AtomicU32::new(0);
-/// Consecutive UpdateLayeredWindow failures with no success in between, and
-/// whether any render ever succeeded in this process.
+/// Consecutive UpdateLayeredWindow failures since the last successful render.
 static LAYERED_RENDER_FAILURES: AtomicU32 = AtomicU32::new(0);
-static LAYERED_RENDER_SUCCEEDED_ONCE: AtomicBool = AtomicBool::new(false);
-/// Failed renders in a row (each after in-process recovery already failed)
-/// before the process restarts itself. Restarting re-creates the HWND and its
-/// DWM surface, the one recovery proven to work; the storm throttle in
-/// relaunch_self bounds the worst case.
-const LAYERED_RENDER_RELAUNCH_THRESHOLD: u32 = 3;
+/// Log persistent render failures periodically without restarting the app.
+const LAYERED_RENDER_FAILURE_LOG_INTERVAL: u32 = 3;
 
 fn note_layered_render_succeeded() {
-    LAYERED_RENDER_SUCCEEDED_ONCE.store(true, Ordering::Relaxed);
     LAYERED_RENDER_FAILURES.store(0, Ordering::Relaxed);
 }
 
-/// Restart the process when the layered surface stays dead across recovery.
-/// Only fires after this process rendered successfully at least once, so a
-/// build that can never render cannot relaunch-loop.
-fn escalate_persistent_layered_failure() {
+/// Keep the app alive when layered rendering fails; report every few retries.
+fn note_layered_render_failed() {
     let failures = LAYERED_RENDER_FAILURES.fetch_add(1, Ordering::Relaxed) + 1;
-    if failures >= LAYERED_RENDER_RELAUNCH_THRESHOLD
-        && LAYERED_RENDER_SUCCEEDED_ONCE.load(Ordering::Relaxed)
-    {
+    if failures >= LAYERED_RENDER_FAILURE_LOG_INTERVAL {
         diagnose::log(format!(
-            "widget surface dead for {failures} consecutive renders; relaunching to rebuild it"
+            "widget surface still failing after {failures} consecutive renders; keeping process alive"
         ));
-        relaunch_self();
+        LAYERED_RENDER_FAILURES.store(0, Ordering::Relaxed);
     }
 }
 
@@ -428,12 +419,23 @@ fn spawn_taskbar_watchdog() {
         let taskbars = native_interop::find_taskbars();
         let widget_alive = unsafe { IsWindow(snapshot.hwnd).as_bool() };
         let attachment_matches = watchdog_attachment_matches(&snapshot, &taskbars, widget_alive);
-        match taskbar_watchdog_action(
+        let action = taskbar_watchdog_action(
             MONITOR_TRANSITION_IN_PROGRESS.load(Ordering::Acquire),
             snapshot.embedded,
             widget_alive,
             attachment_matches,
-        ) {
+        );
+        if diagnose::is_enabled() && action != TaskbarWatchdogAction::Ignore {
+            let actual_parent = unsafe { GetParent(snapshot.hwnd).ok() };
+            diagnose::log(format!(
+                "watchdog sample: action={action:?} hwnd={:?} alive={widget_alive} embedded={} expected_taskbar={:?} actual_parent={actual_parent:?} taskbar_count={} attachment_matches={attachment_matches}",
+                snapshot.hwnd,
+                snapshot.embedded,
+                snapshot.taskbar_hwnd,
+                taskbars.len(),
+            ));
+        }
+        match action {
             TaskbarWatchdogAction::Ignore => {
                 WATCHDOG_STALE_SIGHTINGS.store(0, Ordering::Relaxed);
             }
@@ -450,7 +452,7 @@ fn spawn_taskbar_watchdog() {
                         let _ = PostMessageW(
                             snapshot.hwnd,
                             WM_APP_TASKBAR_CREATED,
-                            WPARAM(0),
+                            WPARAM(WATCHDOG_TASKBAR_REFRESH_WPARAM),
                             LPARAM(0),
                         );
                     }
@@ -484,7 +486,7 @@ fn spawn_taskbar_watchdog() {
                         let _ = PostMessageW(
                             current.hwnd,
                             WM_APP_TASKBAR_CREATED,
-                            WPARAM(0),
+                            WPARAM(WATCHDOG_TASKBAR_REFRESH_WPARAM),
                             LPARAM(0),
                         );
                     },
@@ -521,10 +523,16 @@ fn watchdog_attachment_matches(
     if !snapshot.embedded || !widget_alive {
         return false;
     }
-    let (Some(taskbar_hwnd), Some(effective_monitor)) = (
-        snapshot.taskbar_hwnd,
-        snapshot.effective_monitor_device.as_deref(),
-    ) else {
+    let Some(taskbar_hwnd) = snapshot.taskbar_hwnd else {
+        return false;
+    };
+    if taskbars.is_empty() {
+        return unsafe {
+            IsWindow(taskbar_hwnd).as_bool()
+                && GetParent(snapshot.hwnd).is_ok_and(|parent| parent == taskbar_hwnd)
+        };
+    }
+    let Some(effective_monitor) = snapshot.effective_monitor_device.as_deref() else {
         return false;
     };
     let taskbar_is_current = taskbars.iter().any(|taskbar| {
@@ -3725,6 +3733,145 @@ fn update_quota_tooltips() {
     quota_tooltip::sync(hwnd, regions);
 }
 
+/// Probe alternate UpdateLayeredWindow call shapes once on a diagnostic run.
+fn probe_layered_update_variants(
+    hwnd: HWND,
+    parent: HWND,
+    screen_rect: RECT,
+    parent_client_dst: POINT,
+    size: SIZE,
+    source_dc: HDC,
+    source_pt: POINT,
+    blend: &BLENDFUNCTION,
+) -> bool {
+    static PROBED: AtomicBool = AtomicBool::new(false);
+    if !diagnose::is_enabled() || PROBED.load(Ordering::Relaxed) {
+        return false;
+    }
+
+    #[derive(Clone, Copy)]
+    enum DestinationDc {
+        None,
+        Screen,
+        Parent,
+    }
+
+    let screen_dst = POINT {
+        x: screen_rect.left,
+        y: screen_rect.top,
+    };
+    let screen_dc = unsafe { GetDC(HWND::default()) };
+    let parent_dc = unsafe { GetDC(parent) };
+    let variants = [
+        ("null-point-size", None, Some(size), DestinationDc::None),
+        ("null-point-null-size", None, None, DestinationDc::None),
+        (
+            "screen-point-null-dc",
+            Some(screen_dst),
+            Some(size),
+            DestinationDc::None,
+        ),
+        (
+            "screen-point-screen-dc",
+            Some(screen_dst),
+            Some(size),
+            DestinationDc::Screen,
+        ),
+        (
+            "parent-point-parent-dc",
+            Some(parent_client_dst),
+            Some(size),
+            DestinationDc::Parent,
+        ),
+        (
+            "parent-point-screen-dc",
+            Some(parent_client_dst),
+            Some(size),
+            DestinationDc::Screen,
+        ),
+        (
+            "screen-point-parent-dc",
+            Some(screen_dst),
+            Some(size),
+            DestinationDc::Parent,
+        ),
+    ];
+
+    let mut recovered = false;
+    for (label, destination, update_size, destination_dc) in variants {
+        let hdc_dst = match destination_dc {
+            DestinationDc::None => HDC::default(),
+            DestinationDc::Screen if !screen_dc.is_invalid() => screen_dc,
+            DestinationDc::Parent if !parent_dc.is_invalid() => parent_dc,
+            _ => {
+                diagnose::log(format!(
+                    "layered diagnostic variant {label}: destination DC unavailable"
+                ));
+                continue;
+            }
+        };
+        if !native_interop::reset_layered_surface(hwnd) {
+            diagnose::log(format!("layered diagnostic variant {label}: surface reset failed"));
+            continue;
+        }
+        if PROBED.swap(true, Ordering::Relaxed) {
+            diagnose::log("layered diagnostic probe already claimed by another render");
+            break;
+        }
+        let result = unsafe {
+            UpdateLayeredWindow(
+                hwnd,
+                hdc_dst,
+                destination.as_ref().map(|point| point as *const POINT),
+                update_size.as_ref().map(|size| size as *const SIZE),
+                source_dc,
+                Some(&source_pt),
+                COLORREF(0),
+                Some(blend),
+                ULW_ALPHA,
+            )
+        };
+        match result {
+            Ok(()) => {
+                diagnose::log(format!("layered diagnostic variant {label}: succeeded"));
+                recovered = true;
+            }
+            Err(error) => diagnose::log(format!(
+                "layered diagnostic variant {label} failed: {error}"
+            )),
+        }
+
+        if destination.is_some() {
+            let restored = native_interop::position_window(
+                hwnd,
+                Some(parent),
+                native_interop::WindowPosition {
+                    x: parent_client_dst.x,
+                    y: parent_client_dst.y,
+                    width: size.cx,
+                    height: size.cy,
+                },
+            );
+            diagnose::log(format!(
+                "layered diagnostic variant {label}: restored position={restored}"
+            ));
+        }
+        if recovered {
+            break;
+        }
+    }
+
+    unsafe {
+        if !screen_dc.is_invalid() {
+            let _ = ReleaseDC(HWND::default(), screen_dc);
+        }
+        if !parent_dc.is_invalid() {
+            let _ = ReleaseDC(parent, parent_dc);
+        }
+    }
+    recovered
+}
+
 /// Render opaque taskbar content with ClearType via UpdateLayeredWindow.
 fn render_layered() {
     refresh_dpi();
@@ -3865,8 +4012,6 @@ fn render_layered() {
     let copilot_accent = custom_color(appearance.copilot_accent, copilot_accent_color());
 
     unsafe {
-        let screen_dc = GetDC(hwnd);
-
         let bmi = BITMAPINFO {
             bmiHeader: BITMAPINFOHEADER {
                 biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
@@ -3881,17 +4026,24 @@ fn render_layered() {
         };
 
         let mut bits: *mut std::ffi::c_void = std::ptr::null_mut();
-        let mem_dc = CreateCompatibleDC(screen_dc);
+        let mem_dc = CreateCompatibleDC(None);
         let dib =
             CreateDIBSection(mem_dc, &bmi, DIB_RGB_COLORS, &mut bits, None, 0).unwrap_or_default();
 
         if dib.is_invalid() || bits.is_null() {
+            if !dib.is_invalid() {
+                let _ = DeleteObject(dib);
+            }
             let _ = DeleteDC(mem_dc);
-            ReleaseDC(hwnd, screen_dc);
             return;
         }
 
         let old_bmp = SelectObject(mem_dc, dib);
+        let cleanup = || {
+            let _ = SelectObject(mem_dc, old_bmp);
+            let _ = DeleteObject(dib);
+            let _ = DeleteDC(mem_dc);
+        };
         let pixel_count = (width * height) as usize;
 
         // Render once with the actual taskbar background colour.
@@ -3956,7 +4108,7 @@ fn render_layered() {
         );
         // GDI drawing may still be queued when we read the DIB directly for
         // alpha processing and pass it to UpdateLayeredWindow.
-        let _ = GdiFlush();
+        let gdi_flush_succeeded = GdiFlush().as_bool();
 
         // System mode blends with the taskbar. High contrast modes use a solid
         // backdrop, so text stays legible even over translucent wallpapers.
@@ -3976,7 +4128,46 @@ fn render_layered() {
             }
         }
 
-        // Push to window via UpdateLayeredWindow
+        // Keep the layered surface dimensions and position explicit. For this
+        // child HWND, UpdateLayeredWindow's destination point is parent-client
+        // relative; passing GetWindowRect's screen coordinates moves it offscreen.
+        let Some(window_rect) = native_interop::get_window_rect_safe(hwnd) else {
+            diagnose::log("widget layered surface update skipped: unable to query window rect");
+            cleanup();
+            return;
+        };
+        let Some(parent) = GetParent(hwnd).ok().filter(|parent| !parent.is_invalid()) else {
+            diagnose::log("widget layered surface update skipped: unable to query parent");
+            cleanup();
+            return;
+        };
+        let Some(pt_dst) =
+            native_interop::screen_to_client(parent, window_rect.left, window_rect.top)
+        else {
+            diagnose::log(
+                "widget layered surface update skipped: unable to map window origin to parent",
+            );
+            cleanup();
+            return;
+        };
+        if diagnose::is_enabled() {
+            let selected_bitmap = GetCurrentObject(mem_dc, OBJ_BITMAP);
+            diagnose::log(format!(
+                "layered update inputs: hwnd={hwnd:?} parent={parent:?} screen_rect=({},{}-{},{}), parent_client_dst=({},{}), size={}x{}, rows=session:{show_session_window} weekly:{show_weekly_window}, hdc_dst=None hdc_src={mem_dc:?} gdi_flush={gdi_flush_succeeded} selected_bitmap={selected_bitmap:?} dib={dib:?} bitmap_selected={} bitmap_type={} style={:#x} exstyle={:#x}",
+                window_rect.left,
+                window_rect.top,
+                window_rect.right,
+                window_rect.bottom,
+                pt_dst.x,
+                pt_dst.y,
+                width,
+                height,
+                selected_bitmap.0 == dib.0,
+                GetObjectType(selected_bitmap),
+                GetWindowLongW(hwnd, GWL_STYLE),
+                GetWindowLongW(hwnd, GWL_EXSTYLE),
+            ));
+        }
         let pt_src = POINT { x: 0, y: 0 };
         let sz = SIZE {
             cx: width,
@@ -3991,8 +4182,8 @@ fn render_layered() {
 
         let rendered = UpdateLayeredWindow(
             hwnd,
-            screen_dc,
             None,
+            Some(&pt_dst),
             Some(&sz),
             mem_dc,
             Some(&pt_src),
@@ -4008,7 +4199,7 @@ fn render_layered() {
             let mut recovered = false;
             if native_interop::reset_layered_surface(hwnd) {
                 if let Err(error) = UpdateLayeredWindow(
-                    hwnd, screen_dc, None, Some(&sz), mem_dc, Some(&pt_src),
+                    hwnd, None, Some(&pt_dst), Some(&sz), mem_dc, Some(&pt_src),
                     COLORREF(0), Some(&blend), ULW_ALPHA,
                 ) {
                     diagnose::log_error("widget layered surface recovery failed", error);
@@ -4016,23 +4207,31 @@ fn render_layered() {
                     recovered = true;
                 }
             }
+            if !recovered {
+                recovered = probe_layered_update_variants(
+                    hwnd,
+                    parent,
+                    window_rect,
+                    pt_dst,
+                    sz,
+                    mem_dc,
+                    pt_src,
+                    &blend,
+                );
+            }
             if recovered {
                 note_layered_render_succeeded();
             } else {
-                // The HWND's DWM surface can stay dead even with perfect
-                // styles (seen after Task View); restart to rebuild it rather
-                // than sit invisible until the next manual restart.
-                escalate_persistent_layered_failure();
+                // Keep the process alive when the HWND's DWM surface remains
+                // unavailable after the in-process recovery attempt.
+                note_layered_render_failed();
             }
         } else {
             note_layered_render_succeeded();
         }
 
         // Cleanup
-        SelectObject(mem_dc, old_bmp);
-        let _ = DeleteObject(dib);
-        let _ = DeleteDC(mem_dc);
-        ReleaseDC(hwnd, screen_dc);
+        cleanup();
     }
 }
 
@@ -5057,6 +5256,25 @@ fn recover_polling(hwnd: HWND, network: bool) {
     }
 }
 
+/// Retry widget surface recovery after Windows and the shell have resumed.
+/// The immediate power notification can arrive before Explorer/DWM is ready.
+fn recover_wake_surface(hwnd: HWND) {
+    if MONITOR_TRANSITION_IN_PROGRESS.load(Ordering::Acquire) {
+        unsafe {
+            let _ = SetTimer(hwnd, TIMER_WAKE_RECOVERY, 1_000, None);
+        }
+        return;
+    }
+
+    let placement = refresh_monitor_selection(hwnd);
+    if placement.reposition {
+        position_at_taskbar();
+    }
+    let reset = native_interop::reset_layered_surface(hwnd);
+    diagnose::log(format!("wake recovery: layered surface reset={reset}"));
+    render_layered();
+}
+
 /// Main window procedure
 unsafe extern "system" fn wnd_proc(
     hwnd: HWND,
@@ -5159,6 +5377,7 @@ unsafe extern "system" fn wnd_proc(
                 || wparam.0 == PBT_APMRESUMESUSPEND as usize =>
         {
             recover_polling(hwnd, false);
+            let _ = SetTimer(hwnd, TIMER_WAKE_RECOVERY, 2_000, None);
             LRESULT(1)
         }
         _ if msg == recovery_events::MESSAGE => {
@@ -5219,6 +5438,10 @@ unsafe extern "system" fn wnd_proc(
                         diagnose::log("monitor target resolved; placement retry timer stopped");
                     }
                 }
+                TIMER_WAKE_RECOVERY => {
+                    let _ = KillTimer(hwnd, TIMER_WAKE_RECOVERY);
+                    recover_wake_surface(hwnd);
+                }
                 TIMER_FRESHNESS => {
                     update_display();
                     render_layered();
@@ -5247,6 +5470,29 @@ unsafe extern "system" fn wnd_proc(
             LRESULT(0)
         }
         WM_APP_TASKBAR_CREATED => {
+            if wparam.0 == WATCHDOG_TASKBAR_REFRESH_WPARAM {
+                let attachment_matches = watchdog_window_snapshot().is_some_and(|snapshot| {
+                    snapshot.hwnd == hwnd
+                        && watchdog_attachment_matches(
+                            &snapshot,
+                            &native_interop::find_taskbars(),
+                            IsWindow(snapshot.hwnd).as_bool(),
+                        )
+                });
+                if attachment_matches {
+                    if diagnose::is_enabled() {
+                        diagnose::log("skipping stale watchdog taskbar refresh; attachment matches");
+                    }
+                    return LRESULT(0);
+                }
+            }
+            if diagnose::is_enabled() {
+                diagnose::log(format!(
+                    "taskbar refresh message received wparam={} transition_in_progress={}",
+                    wparam.0,
+                    MONITOR_TRANSITION_IN_PROGRESS.load(Ordering::Acquire),
+                ));
+            }
             if MONITOR_TRANSITION_IN_PROGRESS.load(Ordering::Acquire) {
                 PENDING_TASKBAR_REFRESH.store(true, Ordering::Release);
             } else {
