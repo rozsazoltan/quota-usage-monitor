@@ -3972,23 +3972,10 @@ namespace winrt::SettingsUI::implementation
         auto card = Card();
         auto stack = StackPanel(); stack.Spacing(14);
         const bool available = state_ && state_.GetNamedBoolean(L"update_available", false);
-        if (available)
-        {
-            auto badge = Border(); badge.Padding(Thickness{ 11, 5, 11, 5 });
-            badge.CornerRadius(CornerRadiusHelper::FromUniformRadius(12));
-            badge.Background(Application::Current().Resources().Lookup(box_value(L"AccentFillColorDefaultBrush")).as<Media::Brush>());
-            auto badgeText = Label(L"UPDATE AVAILABLE", 11);
-            badgeText.FontWeight(Windows::UI::Text::FontWeights::SemiBold());
-            badgeText.Foreground(Application::Current().Resources().Lookup(box_value(L"TextOnAccentFillColorPrimaryBrush")).as<Media::Brush>());
-            badge.Child(badgeText); stack.Children().Append(badge);
-        }
         stack.Children().Append(Label(available ? L"A newer version is ready" : L"Check for an update", 21));
         updateStatusText_ = Label(state_ ? NativeLocalization::Translate(std::wstring(state_.GetNamedString(L"update_status", L"Update status unavailable").c_str()), g_nativeLanguage) : NativeLocalization::Translate(L"Checking update status…", g_nativeLanguage), 14);
         updateStatusText_.TextWrapping(TextWrapping::Wrap);
         stack.Children().Append(updateStatusText_);
-        auto version = Label(state_ ? NativeLocalization::Translate(L"Installed version  ·  ", g_nativeLanguage) + NativeLocalization::Translate(std::wstring(state_.GetNamedString(L"version", L"unknown").c_str()), g_nativeLanguage) : NativeLocalization::Translate(L"Installed version is being checked…", g_nativeLanguage), 13);
-        version.Foreground(Application::Current().Resources().Lookup(box_value(L"TextFillColorSecondaryBrush")).as<Media::Brush>());
-        stack.Children().Append(version);
         checkForUpdatesButton_ = Button();
         checkForUpdatesButton_.Content(box_value(NativeLocalization::Translate(available ? L"Install update" : L"Check for updates", g_nativeLanguage)));
         Microsoft::UI::Xaml::Automation::AutomationProperties::SetAutomationId(checkForUpdatesButton_, L"CheckForUpdates");
