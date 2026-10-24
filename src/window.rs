@@ -5692,33 +5692,6 @@ fn open_settings(hwnd: HWND, page: Page) {
     }
 }
 
-/// Forwards a picked context-menu command to the widget window. The widget
-/// itself is a WS_CHILD of Explorer's taskbar and a child window can never
-/// become the foreground window, which TrackPopupMenu requires — without a
-/// foreground owner the menu dismisses itself instantly. The menu is hosted
-/// on a throwaway top-level popup instead; commands arrive here and are
-/// relayed so the existing WM_COMMAND handling stays untouched.
-unsafe extern "system" fn menu_owner_proc(
-    hwnd: HWND,
-    msg: u32,
-    wparam: WPARAM,
-    lparam: LPARAM,
-) -> LRESULT {
-    if msg == WM_COMMAND {
-        let target = HWND(GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut core::ffi::c_void);
-        diagnose::log(format!(
-            "context menu command picked id={} target_valid={}",
-            (wparam.0 & 0xffff) as u16,
-            !target.is_invalid()
-        ));
-        if !target.is_invalid() {
-            let _ = SendMessageW(target, WM_COMMAND, wparam, lparam);
-        }
-        return LRESULT(0);
-    }
-    DefWindowProcW(hwnd, msg, wparam, lparam)
-}
-
 fn show_settings_menu(hwnd: HWND) {
     let (strings, visible) = {
         let state = lock_state();
@@ -5775,45 +5748,9 @@ fn show_settings_menu(hwnd: HWND) {
         }
         let mut point = POINT::default();
         let _ = GetCursorPos(&mut point);
-        // Host the menu on a temporary top-level popup: the embedded widget
-        // cannot take the foreground, so TrackPopupMenu owned by it would
-        // vanish before the user can pick anything.
-        let class_name = native_interop::wide_str("QuotaUsageMenuOwner");
-        let hinstance = GetModuleHandleW(PCWSTR::null())
-            .map(|handle| HINSTANCE(handle.0))
-            .unwrap_or_default();
-        let _ = RegisterClassW(&WNDCLASSW {
-            lpfnWndProc: Some(menu_owner_proc),
-            hInstance: hinstance,
-            lpszClassName: PCWSTR::from_raw(class_name.as_ptr()),
-            ..Default::default()
-        });
-        let owner = CreateWindowExW(
-            WS_EX_TOOLWINDOW,
-            PCWSTR::from_raw(class_name.as_ptr()),
-            PCWSTR::null(),
-            WS_POPUP,
-            0,
-            0,
-            1,
-            1,
-            HWND::default(),
-            HMENU::default(),
-            hinstance,
-            None,
-        );
-        let owner = match owner {
-            Ok(owner) => {
-                SetWindowLongPtrW(owner, GWLP_USERDATA, hwnd.0 as isize);
-                owner
-            }
-            Err(error) => {
-                diagnose::log(format!(
-                    "context menu owner fallback to widget: {error}"
-                ));
-                hwnd
-            }
-        };
+        // A child widget's top-level parent must own its context menu.
+        let root = GetAncestor(hwnd, GA_ROOT);
+        let owner = if root.is_invalid() { hwnd } else { root };
         let foreground = SetForegroundWindow(owner);
         // TPM_RETURNCMD hands the picked item id back directly instead of
         // routing WM_COMMAND through the owner window, which proved
@@ -5836,9 +5773,6 @@ fn show_settings_menu(hwnd: HWND) {
             let _ = SendMessageW(hwnd, WM_COMMAND, WPARAM(picked.0 as usize), LPARAM(0));
         }
         let _ = PostMessageW(owner, WM_NULL, WPARAM(0), LPARAM(0));
-        if owner != hwnd {
-            let _ = DestroyWindow(owner);
-        }
         let _ = DestroyMenu(menu);
     }
 }
