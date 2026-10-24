@@ -549,6 +549,12 @@ pub fn set_window_mode(hwnd: HWND, parent: Option<HWND>, position: WindowPositio
     set_window_mode_inner(hwnd, parent, position, true)
 }
 
+/// Place a per-pixel layered visual without selecting constant-alpha mode.
+/// SetLayeredWindowAttributes would prevent its first UpdateLayeredWindow.
+pub fn set_layered_window_mode(hwnd: HWND, parent: Option<HWND>, position: WindowPosition) -> bool {
+    set_window_mode_inner(hwnd, parent, position, false)
+}
+
 fn set_window_mode_inner(
     hwnd: HWND,
     parent: Option<HWND>,
