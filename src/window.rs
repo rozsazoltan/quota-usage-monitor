@@ -5692,6 +5692,15 @@ fn open_settings(hwnd: HWND, page: Page) {
     }
 }
 
+unsafe extern "system" fn menu_owner_proc(
+    hwnd: HWND,
+    msg: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> LRESULT {
+    DefWindowProcW(hwnd, msg, wparam, lparam)
+}
+
 fn show_settings_menu(hwnd: HWND) {
     let (strings, visible) = {
         let state = lock_state();
@@ -5748,32 +5757,85 @@ fn show_settings_menu(hwnd: HWND) {
         }
         let mut point = POINT::default();
         let _ = GetCursorPos(&mut point);
-        // A child widget's top-level parent must own its context menu.
-        let root = GetAncestor(hwnd, GA_ROOT);
-        let owner = if root.is_invalid() { hwnd } else { root };
+        // A transient topmost owner keeps the popup above the embedded widget
+        // without changing the widget or Explorer's persistent z-order.
+        let class_name = native_interop::wide_str("QuotaUsageMenuOwner");
+        let hinstance = GetModuleHandleW(PCWSTR::null())
+            .map(|handle| HINSTANCE(handle.0))
+            .unwrap_or_default();
+        let _ = RegisterClassW(&WNDCLASSW {
+            lpfnWndProc: Some(menu_owner_proc),
+            hInstance: hinstance,
+            lpszClassName: PCWSTR::from_raw(class_name.as_ptr()),
+            ..Default::default()
+        });
+        let (owner, transient_owner) = match CreateWindowExW(
+            WS_EX_TOOLWINDOW,
+            PCWSTR::from_raw(class_name.as_ptr()),
+            PCWSTR::null(),
+            WS_POPUP,
+            point.x,
+            point.y,
+            1,
+            1,
+            HWND::default(),
+            HMENU::default(),
+            hinstance,
+            None,
+        ) {
+            Ok(owner) => {
+                let topmost = SetWindowPos(
+                    owner,
+                    HWND_TOPMOST,
+                    point.x,
+                    point.y,
+                    1,
+                    1,
+                    SWP_NOACTIVATE | SWP_NOOWNERZORDER | SWP_SHOWWINDOW,
+                )
+                .is_ok();
+                if topmost {
+                    (owner, true)
+                } else {
+                    diagnose::log(format!(
+                        "context menu helper could not become topmost: {}",
+                        std::io::Error::last_os_error()
+                    ));
+                    let _ = DestroyWindow(owner);
+                    (hwnd, false)
+                }
+            }
+            Err(error) => {
+                diagnose::log(format!("context menu helper creation failed: {error}"));
+                (hwnd, false)
+            }
+        };
         let foreground = SetForegroundWindow(owner);
         // TPM_RETURNCMD hands the picked item id back directly instead of
         // routing WM_COMMAND through the owner window, which proved
         // unreliable while the widget lives inside Explorer's taskbar.
         let picked = TrackPopupMenuEx(
             menu,
-            TPM_RETURNCMD.0,
+            TPM_NONOTIFY.0 | TPM_RETURNCMD.0,
             point.x,
             point.y,
             owner,
             None,
         );
         diagnose::log(format!(
-            "context menu popup result foreground_set={} picked={} error={}",
+            "context menu popup result transient_owner={} foreground_set={} picked={} error={}",
+            transient_owner,
             foreground.as_bool(),
             picked.0,
             std::io::Error::last_os_error()
         ));
+        let _ = DestroyMenu(menu);
+        if transient_owner {
+            let _ = DestroyWindow(owner);
+        }
         if picked.0 != 0 {
             let _ = SendMessageW(hwnd, WM_COMMAND, WPARAM(picked.0 as usize), LPARAM(0));
         }
-        let _ = PostMessageW(owner, WM_NULL, WPARAM(0), LPARAM(0));
-        let _ = DestroyMenu(menu);
     }
 }
 
