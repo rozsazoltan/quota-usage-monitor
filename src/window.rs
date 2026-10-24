@@ -55,8 +55,9 @@ impl SendHwnd {
 
 /// Shared application state
 struct AppState {
+    // Stable controller: async messages, timers, tray and application lifetime.
     hwnd: SendHwnd,
-    taskbar_broadcast_hwnd: Option<HWND>,
+    visual_hwnd: SendHwnd,
     taskbar_hwnd: Option<HWND>,
     tray_notify_hwnd: Option<HWND>,
     win_event_hook: Option<HWINEVENTHOOK>,
@@ -221,6 +222,8 @@ const IDM_UNINSTALL: u16 = 105;
 const IDM_MONITOR_FIRST: u16 = 200;
 const MAX_MONITOR_MENU_ITEMS: usize = 100;
 const IDM_SETTINGS: u16 = 106;
+const IDM_RESTORE_WIDGET_DISPLAY: u16 = 108;
+const TIMER_MANUAL_WAKE_RECOVERY: usize = 8;
 #[cfg(debug_assertions)]
 const VK_F12_KEY_CODE: usize = 0x7B;
 const IDM_APPEARANCE_PAGE: u16 = 107;
@@ -247,6 +250,9 @@ static PENDING_TASKBAR_REFRESH: AtomicBool = AtomicBool::new(false);
 /// repeated mismatch triggers a refresh, because ripping a healthy child out
 /// of the taskbar over one transient can poison the surface.
 static WATCHDOG_STALE_SIGHTINGS: AtomicU32 = AtomicU32::new(0);
+static RESTART_IN_PROGRESS: AtomicBool = AtomicBool::new(false);
+static UNINSTALL_IN_PROGRESS: AtomicBool = AtomicBool::new(false);
+static EXIT_IN_PROGRESS: AtomicBool = AtomicBool::new(false);
 /// Consecutive UpdateLayeredWindow failures since the last successful render.
 static LAYERED_RENDER_FAILURES: AtomicU32 = AtomicU32::new(0);
 /// Log persistent render failures periodically without restarting the app.
@@ -324,7 +330,7 @@ fn sc(px: i32) -> i32 {
 fn refresh_dpi() {
     let hwnd = {
         let state = lock_state();
-        state.as_ref().map(|s| s.hwnd.to_hwnd())
+        state.as_ref().map(|s| s.visual_hwnd.to_hwnd())
     };
     if let Some(hwnd) = hwnd {
         let dpi = unsafe { GetDpiForWindow(hwnd) };
@@ -334,69 +340,10 @@ fn refresh_dpi() {
     }
 }
 
-/// Spacing below which two relaunches are treated as a storm (e.g. explorer.exe
-/// crash-looping); when detected we back off instead of spawning in a tight loop.
-const RELAUNCH_THROTTLE_SECS: u64 = 10;
-const RELAUNCH_BACKOFF_SECS: u64 = 30;
 /// Environment flag set on a relaunched child so it waits for the previous
 /// instance's single-instance mutex instead of exiting immediately.
 const ENV_RELAUNCH: &str = "QUOTA_USAGE_RELAUNCH";
 const LEGACY_ENV_RELAUNCH: &str = "CODEX_USAGE_RELAUNCH";
-/// Unix timestamp (seconds) of the relaunch that spawned this process, passed to
-/// the child so it can detect a relaunch storm.
-const ENV_LAST_RELAUNCH_UNIX: &str = "QUOTA_USAGE_LAST_RELAUNCH_UNIX";
-const LEGACY_ENV_LAST_RELAUNCH_UNIX: &str = "CODEX_USAGE_LAST_RELAUNCH_UNIX";
-
-/// Relaunch the widget as a fresh process after explorer.exe has restarted.
-///
-/// When the shell restarts it destroys our embedded child window outright (the
-/// window is gone, not merely orphaned - `IsWindow` returns false) and leaves
-/// the UI thread parked in `GetMessage` with no window to recreate in place.
-/// Spawning a clean new process - which re-embeds into the freshly created
-/// taskbar - and exiting this one is the robust recovery. The child is flagged
-/// via `ENV_RELAUNCH` so it waits for this instance's single-instance mutex to
-/// be released before taking over (see the guard in `run`).
-fn relaunch_self() {
-    settings_ui::shutdown();
-    // Back off if we are relaunching very soon after the relaunch that spawned
-    // us: that signals the shell is crash-looping, not a one-off restart.
-    let now = now_unix_secs();
-    let last = std::env::var(ENV_LAST_RELAUNCH_UNIX)
-        .or_else(|_| std::env::var(LEGACY_ENV_LAST_RELAUNCH_UNIX))
-        .ok()
-        .and_then(|v| v.parse::<u64>().ok())
-        .unwrap_or(0);
-    if last != 0 && now.saturating_sub(last) < RELAUNCH_THROTTLE_SECS {
-        diagnose::log("relaunch storm detected; backing off before relaunching");
-        std::thread::sleep(Duration::from_secs(RELAUNCH_BACKOFF_SECS));
-    }
-
-    let exe = match std::env::current_exe() {
-        Ok(exe) => exe,
-        Err(error) => {
-            diagnose::log_error("watchdog: unable to resolve current executable", error);
-            return;
-        }
-    };
-
-    let args: Vec<String> = std::env::args().skip(1).collect();
-    match std::process::Command::new(exe)
-        .args(&args)
-        .env_remove(LEGACY_ENV_RELAUNCH)
-        .env_remove(LEGACY_ENV_LAST_RELAUNCH_UNIX)
-        .env(ENV_RELAUNCH, "1")
-        .env(ENV_LAST_RELAUNCH_UNIX, now.to_string())
-        .spawn()
-    {
-        Ok(_) => {
-            diagnose::log("watchdog: relaunched fresh instance, exiting old one");
-            std::process::exit(0);
-        }
-        Err(error) => {
-            diagnose::log_error("watchdog: unable to spawn relaunched instance", error);
-        }
-    }
-}
 
 /// Detect explorer.exe restarts and recover from them.
 ///
@@ -405,8 +352,11 @@ fn relaunch_self() {
 /// stale live attachments in-process and relaunches only when the widget HWND is
 /// gone.
 fn spawn_taskbar_watchdog() {
-    std::thread::spawn(move || loop {
+    std::thread::spawn(move || {
+      let mut requested_visual = None;
+      loop {
         std::thread::sleep(Duration::from_secs(TASKBAR_WATCH_INTERVAL_SECS));
+        if EXIT_IN_PROGRESS.load(Ordering::Acquire) { break; }
         if MONITOR_TRANSITION_IN_PROGRESS.load(Ordering::Acquire) {
             continue;
         }
@@ -438,68 +388,46 @@ fn spawn_taskbar_watchdog() {
         match action {
             TaskbarWatchdogAction::Ignore => {
                 WATCHDOG_STALE_SIGHTINGS.store(0, Ordering::Relaxed);
+                requested_visual = None;
             }
             TaskbarWatchdogAction::Refresh => {
                 let sightings = WATCHDOG_STALE_SIGHTINGS.fetch_add(1, Ordering::Relaxed) + 1;
                 if sightings < 2 {
                     diagnose::log("watchdog: stale attachment sighted once; waiting to confirm");
                 } else {
+                    if requested_visual == Some(snapshot.hwnd.0 as isize) { continue; }
                     WATCHDOG_STALE_SIGHTINGS.store(1, Ordering::Relaxed);
                     diagnose::log(
                         "watchdog: live widget attachment is stale; requesting in-process refresh",
                     );
                     unsafe {
                         let _ = PostMessageW(
-                            snapshot.hwnd,
+                            snapshot.controller,
                             WM_APP_TASKBAR_CREATED,
                             WPARAM(WATCHDOG_TASKBAR_REFRESH_WPARAM),
-                            LPARAM(0),
+                            LPARAM(snapshot.hwnd.0 as isize),
                         );
                     }
+                    requested_visual = Some(snapshot.hwnd.0 as isize);
                 }
             }
             TaskbarWatchdogAction::Relaunch => {
-                // Re-read both the transition guard and the live HWND immediately
-                // before relaunching; an obsolete taskbar snapshot must not
-                // restart a widget that has since migrated successfully.
-                if MONITOR_TRANSITION_IN_PROGRESS.load(Ordering::Acquire) {
-                    continue;
+                if requested_visual == Some(snapshot.hwnd.0 as isize) { continue; }
+                unsafe {
+                    let _ = PostMessageW(snapshot.controller, WM_APP_TASKBAR_CREATED,
+                        WPARAM(WATCHDOG_TASKBAR_REFRESH_WPARAM), LPARAM(snapshot.hwnd.0 as isize));
                 }
-                let Some(current) = watchdog_window_snapshot() else {
-                    continue;
-                };
-                let current_alive = unsafe { IsWindow(current.hwnd).as_bool() };
-                let current_taskbars = native_interop::find_taskbars();
-                let current_attachment_matches =
-                    watchdog_attachment_matches(&current, &current_taskbars, current_alive);
-                match taskbar_watchdog_action(
-                    MONITOR_TRANSITION_IN_PROGRESS.load(Ordering::Acquire),
-                    current.embedded,
-                    current_alive,
-                    current_attachment_matches,
-                ) {
-                    TaskbarWatchdogAction::Relaunch => {
-                        diagnose::log("watchdog: widget HWND was destroyed; relaunching");
-                        relaunch_self();
-                    }
-                    TaskbarWatchdogAction::Refresh => unsafe {
-                        let _ = PostMessageW(
-                            current.hwnd,
-                            WM_APP_TASKBAR_CREATED,
-                            WPARAM(WATCHDOG_TASKBAR_REFRESH_WPARAM),
-                            LPARAM(0),
-                        );
-                    },
-                    TaskbarWatchdogAction::Ignore => {}
-                }
+                requested_visual = Some(snapshot.hwnd.0 as isize);
             }
         }
+      }
     });
 }
 
 #[derive(Clone)]
 struct WatchdogWindowSnapshot {
     hwnd: HWND,
+    controller: HWND,
     embedded: bool,
     taskbar_hwnd: Option<HWND>,
     effective_monitor_device: Option<String>,
@@ -508,7 +436,8 @@ struct WatchdogWindowSnapshot {
 fn watchdog_window_snapshot() -> Option<WatchdogWindowSnapshot> {
     let state = lock_state();
     state.as_ref().map(|state| WatchdogWindowSnapshot {
-        hwnd: state.hwnd.to_hwnd(),
+        hwnd: state.visual_hwnd.to_hwnd(),
+        controller: state.hwnd.to_hwnd(),
         embedded: state.embedded,
         taskbar_hwnd: state.taskbar_hwnd,
         effective_monitor_device: state.effective_monitor_device.clone(),
@@ -614,6 +543,29 @@ static STATE: Mutex<Option<AppState>> = Mutex::new(None);
 /// Lock STATE safely, recovering from poisoned mutex
 fn lock_state() -> MutexGuard<'static, Option<AppState>> {
     STATE.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+fn controller_window(fallback: HWND) -> HWND {
+    lock_state().as_ref().map_or(fallback, |s| s.hwnd.to_hwnd())
+}
+
+fn visual_window(fallback: HWND) -> HWND {
+    lock_state().as_ref().map_or(fallback, |s| s.visual_hwnd.to_hwnd())
+}
+
+fn create_visual_window(language: LanguageId, width: i32) -> windows::core::Result<HWND> {
+    let class_name = native_interop::wide_str("QuotaUsage");
+    let title = native_interop::wide_str(language.strings().window_title);
+    unsafe {
+        CreateWindowExW(
+            WS_EX_TOOLWINDOW | WS_EX_LAYERED | WS_EX_NOACTIVATE,
+            PCWSTR::from_raw(class_name.as_ptr()),
+            PCWSTR::from_raw(title.as_ptr()),
+            WS_POPUP,
+            0, 0, width, sc(WIDGET_HEIGHT),
+            HWND::default(), HMENU::default(), GetModuleHandleW(PCWSTR::null())?, None,
+        )
+    }
 }
 
 const SETTINGS_DIR: &str = "QuotaUsage";
@@ -1589,6 +1541,7 @@ fn recover_widget_visibility(hwnd: HWND) {
     // WS_VISIBLE remains set while minimized, so the routine visibility guard
     // intentionally does not suffice here.
     let placement = refresh_monitor_selection(hwnd);
+    let hwnd = visual_window(hwnd);
     unsafe {
         let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
     }
@@ -1600,6 +1553,7 @@ fn recover_widget_visibility(hwnd: HWND) {
 }
 
 fn set_widget_visibility(hwnd: HWND, visible: bool) {
+    let hwnd = visual_window(hwnd);
     unsafe {
         // Placement retries must not repeatedly show/raise an already visible
         // widget. Inspect its own visibility bit: Explorer may hide the parent
@@ -1734,7 +1688,7 @@ impl MonitorTransitionGuard {
         MONITOR_TRANSITION_IN_PROGRESS
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
             .ok()
-            .map(|_| Self(hwnd))
+            .map(|_| Self(controller_window(hwnd)))
     }
 }
 
@@ -1761,6 +1715,7 @@ impl Drop for MonitorTransitionGuard {
 }
 
 fn transition_to_monitor(hwnd: HWND, target: &ResolvedMonitorTarget) -> bool {
+    let hwnd = visual_window(hwnd);
     let (tray_offset, anchor_left, dragging, embedded, current_taskbar, selection_pending) = {
         let state = lock_state();
         let Some(s) = state.as_ref() else {
@@ -1779,11 +1734,6 @@ fn transition_to_monitor(hwnd: HWND, target: &ResolvedMonitorTarget) -> bool {
         return false;
     }
 
-    refresh_dpi();
-    let width = total_widget_width();
-    let height = sc(WIDGET_HEIGHT);
-    let floating_position =
-        floating_window_position(target.monitor.rect, width, height, anchor_left, tray_offset);
     let Some(_transition) = MonitorTransitionGuard::new(hwnd) else {
         return false;
     };
@@ -1811,6 +1761,30 @@ fn transition_to_monitor(hwnd: HWND, target: &ResolvedMonitorTarget) -> bool {
         }
     }
 
+    let Some(placement) = place_visual_window(hwnd, target, tray_offset, anchor_left) else {
+        return false;
+    };
+    commit_visual_placement(target, placement);
+    true
+}
+
+struct VisualPlacement {
+    embedded: bool,
+    taskbar: Option<native_interop::TaskbarWindow>,
+}
+
+// Shared startup/monitor/recovery placement. It changes only the supplied HWND;
+// application placement and hooks are committed separately after validation.
+fn place_visual_window(
+    hwnd: HWND,
+    target: &ResolvedMonitorTarget,
+    tray_offset: i32,
+    anchor_left: bool,
+) -> Option<VisualPlacement> {
+    let width = total_widget_width();
+    let height = sc(WIDGET_HEIGHT);
+    let floating_position =
+        floating_window_position(target.monitor.rect, width, height, anchor_left, tray_offset);
     let (embedded, position, taskbar) = if let Some((_, taskbar)) = target.taskbar {
         let rect = native_interop::get_taskbar_rect(taskbar.hwnd).unwrap_or(taskbar.rect);
         let tray_left = tray_left_for_taskbar(taskbar.hwnd, rect);
@@ -1829,23 +1803,26 @@ fn transition_to_monitor(hwnd: HWND, target: &ResolvedMonitorTarget) -> bool {
                 "taskbar attachment unavailable on {}; retaining current placement for retry",
                 target.monitor.device
             ));
-            return false;
+            return None;
         };
-        if !native_interop::set_window_mode(hwnd, Some(taskbar.hwnd), position) {
+        if !native_interop::set_layered_window_mode(hwnd, Some(taskbar.hwnd), position) {
             diagnose::log(format!(
                 "taskbar attachment failed on {}; retaining current placement for retry",
                 target.monitor.device
             ));
-            return false;
+            return None;
         }
         (true, position, Some(taskbar))
-    } else if native_interop::set_window_mode(hwnd, None, floating_position) {
+    } else if native_interop::set_layered_window_mode(hwnd, None, floating_position) {
         (false, floating_position, None)
     } else {
-        return false;
+        return None;
     };
 
-    refresh_dpi();
+    let dpi = unsafe { GetDpiForWindow(hwnd) };
+    if dpi > 0 {
+        CURRENT_DPI.store(dpi, Ordering::Relaxed);
+    }
     let width_after_move = total_widget_width();
     let height_after_move = sc(WIDGET_HEIGHT);
     let adjusted_position = if let Some(taskbar) = taskbar {
@@ -1874,11 +1851,15 @@ fn transition_to_monitor(hwnd: HWND, target: &ResolvedMonitorTarget) -> bool {
     if adjusted_position != position {
         let parent = taskbar.map(|taskbar| taskbar.hwnd);
         if !native_interop::position_window(hwnd, parent, adjusted_position) {
-            diagnose::log(
-                "monitor transition DPI-adjusted position failed; keeping first placement",
-            );
+            diagnose::log("monitor transition DPI-adjusted position failed");
+            return None;
         }
     }
+    Some(VisualPlacement { embedded, taskbar })
+}
+
+fn commit_visual_placement(target: &ResolvedMonitorTarget, placement: VisualPlacement) {
+    let VisualPlacement { embedded, taskbar } = placement;
     let (taskbar_index, taskbar_hwnd) = match taskbar {
         Some(taskbar) => (target.taskbar.map(|(index, _)| index), Some(taskbar.hwnd)),
         None => (None, None),
@@ -1899,7 +1880,7 @@ fn transition_to_monitor(hwnd: HWND, target: &ResolvedMonitorTarget) -> bool {
             if let Some(hook) = hook {
                 native_interop::unhook_win_event(hook);
             }
-            return false;
+            return;
         };
         let old_hook = s.win_event_hook.take();
         s.taskbar_hwnd = taskbar_hwnd;
@@ -1917,8 +1898,6 @@ fn transition_to_monitor(hwnd: HWND, target: &ResolvedMonitorTarget) -> bool {
     if let Some(hook) = old_hook {
         native_interop::unhook_win_event(hook);
     }
-    drop(_transition);
-    true
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1928,6 +1907,8 @@ struct MonitorRefreshResult {
 }
 
 fn refresh_monitor_selection(hwnd: HWND) -> MonitorRefreshResult {
+    let controller = controller_window(hwnd);
+    let hwnd = visual_window(hwnd);
     if MONITOR_TRANSITION_IN_PROGRESS.load(Ordering::Acquire) {
         return MonitorRefreshResult {
             retry: true,
@@ -1974,7 +1955,7 @@ fn refresh_monitor_selection(hwnd: HWND) -> MonitorRefreshResult {
         requested_for_resolution.as_deref(),
         legacy_device.as_deref(),
     ) else {
-        let _ = unsafe { SetTimer(hwnd, TIMER_TASKBAR_RETRY, 2_000, None) };
+        let _ = unsafe { SetTimer(controller, TIMER_TASKBAR_RETRY, 2_000, None) };
         return MonitorRefreshResult {
             retry: true,
             reposition: false,
@@ -2000,7 +1981,7 @@ fn refresh_monitor_selection(hwnd: HWND) -> MonitorRefreshResult {
         transition_to_monitor(hwnd, &target)
     };
     if !transitioned {
-        let _ = unsafe { SetTimer(hwnd, TIMER_TASKBAR_RETRY, 2_000, None) };
+        let _ = unsafe { SetTimer(controller, TIMER_TASKBAR_RETRY, 2_000, None) };
         return MonitorRefreshResult {
             retry: true,
             reposition: false,
@@ -2056,9 +2037,9 @@ fn refresh_monitor_selection(hwnd: HWND) -> MonitorRefreshResult {
         || !lock_state().as_ref().is_some_and(|state| state.embedded);
     unsafe {
         if needs_retry {
-            SetTimer(hwnd, TIMER_TASKBAR_RETRY, 2_000, None);
+            SetTimer(controller, TIMER_TASKBAR_RETRY, 2_000, None);
         } else {
-            let _ = KillTimer(hwnd, TIMER_TASKBAR_RETRY);
+            let _ = KillTimer(controller, TIMER_TASKBAR_RETRY);
         }
     }
     apply_configured_widget_visibility(hwnd);
@@ -2487,8 +2468,28 @@ fn confirm_and_begin_uninstall(hwnd: HWND) {
         return;
     }
 
+    let operation_blocked = {
+        let state = lock_state();
+        if RESTART_IN_PROGRESS.load(Ordering::Acquire)
+            || EXIT_IN_PROGRESS.load(Ordering::Acquire)
+            || UNINSTALL_IN_PROGRESS.load(Ordering::Acquire)
+            || state.as_ref().is_some_and(|state| {
+                matches!(state.update_status, UpdateStatus::Checking | UpdateStatus::Applying)
+            })
+        {
+            true
+        } else {
+            UNINSTALL_IN_PROGRESS.store(true, Ordering::Release);
+            false
+        }
+    };
+    if operation_blocked {
+        show_error_message(hwnd, title, "An update, restart, or uninstall is already in progress.");
+        return;
+    }
     settings_ui::shutdown();
     if let Err(error) = crate::uninstaller::begin_uninstall(choice == IDYES) {
+        UNINSTALL_IN_PROGRESS.store(false, Ordering::Release);
         show_error_message(
             hwnd,
             if chinese {
@@ -2582,29 +2583,36 @@ fn update_available(status: &UpdateStatus) -> bool {
 
 fn begin_update_check(hwnd: HWND, interactive: bool) {
     let send_hwnd = SendHwnd::from_hwnd(hwnd);
-    let (strings, install_channel) = {
+    let (strings, install_channel, blocked) = {
         let mut state = lock_state();
         let Some(app_state) = state.as_mut() else {
             return;
         };
 
-        if matches!(
-            app_state.update_status,
-            UpdateStatus::Checking | UpdateStatus::Applying
-        ) {
-            if interactive {
-                show_info_message(
-                    hwnd,
-                    app_state.language.strings().updates,
-                    app_state.language.strings().update_in_progress,
-                );
-            }
-            return;
+        if RESTART_IN_PROGRESS.load(Ordering::Acquire)
+            || UNINSTALL_IN_PROGRESS.load(Ordering::Acquire)
+            || EXIT_IN_PROGRESS.load(Ordering::Acquire)
+            || matches!(
+                app_state.update_status,
+                UpdateStatus::Checking | UpdateStatus::Applying
+            )
+        {
+            (app_state.language.strings(), app_state.install_channel, true)
+        } else {
+            app_state.update_status = UpdateStatus::Checking;
+            (app_state.language.strings(), app_state.install_channel, false)
         }
-
-        app_state.update_status = UpdateStatus::Checking;
-        (app_state.language.strings(), app_state.install_channel)
     };
+    if blocked {
+        if interactive {
+            show_info_message(
+                hwnd,
+                strings.updates,
+                strings.update_in_progress,
+            );
+        }
+        return;
+    }
 
     std::thread::spawn(move || {
         let hwnd = send_hwnd.to_hwnd();
@@ -2667,29 +2675,32 @@ fn begin_update_check(hwnd: HWND, interactive: bool) {
 }
 
 fn begin_update_apply(hwnd: HWND, release: ReleaseDescriptor) {
-    settings_ui::shutdown();
     let send_hwnd = SendHwnd::from_hwnd(hwnd);
-    let strings = {
+    let (strings, blocked) = {
         let mut state = lock_state();
         let Some(app_state) = state.as_mut() else {
             return;
         };
 
-        if matches!(
-            app_state.update_status,
-            UpdateStatus::Checking | UpdateStatus::Applying
-        ) {
-            show_info_message(
-                hwnd,
-                app_state.language.strings().updates,
-                app_state.language.strings().update_in_progress,
-            );
-            return;
+        if RESTART_IN_PROGRESS.load(Ordering::Acquire)
+            || UNINSTALL_IN_PROGRESS.load(Ordering::Acquire)
+            || EXIT_IN_PROGRESS.load(Ordering::Acquire)
+            || matches!(
+                app_state.update_status,
+                UpdateStatus::Checking | UpdateStatus::Applying
+            )
+        {
+            (app_state.language.strings(), true)
+        } else {
+            app_state.update_status = UpdateStatus::Applying;
+            (app_state.language.strings(), false)
         }
-
-        app_state.update_status = UpdateStatus::Applying;
-        app_state.language.strings()
     };
+    if blocked {
+        show_info_message(hwnd, strings.updates, strings.update_in_progress);
+        return;
+    }
+    settings_ui::shutdown();
 
     std::thread::spawn(move || {
         let hwnd = send_hwnd.to_hwnd();
@@ -2715,18 +2726,36 @@ fn begin_update_apply(hwnd: HWND, release: ReleaseDescriptor) {
 }
 
 fn begin_winget_update(hwnd: HWND) {
-    settings_ui::shutdown();
-    let strings = {
-        let state = lock_state();
-        state.as_ref().map(|s| s.language.strings())
+    let (strings, blocked, previous_status) = {
+        let mut state = lock_state();
+        let Some(app_state) = state.as_mut() else {
+            return;
+        };
+        if RESTART_IN_PROGRESS.load(Ordering::Acquire)
+            || UNINSTALL_IN_PROGRESS.load(Ordering::Acquire)
+            || EXIT_IN_PROGRESS.load(Ordering::Acquire)
+            || matches!(app_state.update_status, UpdateStatus::Checking | UpdateStatus::Applying)
+        {
+            (app_state.language.strings(), true, None)
+        } else {
+            let previous = app_state.update_status.clone();
+            app_state.update_status = UpdateStatus::Applying;
+            (app_state.language.strings(), false, Some(previous))
+        }
+    };
+    if blocked {
+        show_info_message(hwnd, strings.updates, strings.update_in_progress);
+        return;
     }
-    .unwrap_or(LanguageId::English.strings());
-
+    settings_ui::shutdown();
     match updater::begin_winget_update() {
         Ok(()) => unsafe {
             let _ = PostMessageW(hwnd, WM_CLOSE, WPARAM(0), LPARAM(0));
         },
         Err(error) => {
+            if let (Some(state), Some(previous_status)) = (lock_state().as_mut(), previous_status) {
+                state.update_status = previous_status;
+            }
             let message = format!("{}.\n\n{}", strings.update_failed, error);
             show_error_message(hwnd, strings.updates, &message);
         }
@@ -3346,7 +3375,6 @@ pub fn run() {
         let install_channel = updater::current_install_channel();
 
         // Create as layered popup (will be reparented into taskbar)
-        let title = native_interop::wide_str(language.strings().window_title);
         let initial_model_count = active_model_count(
             settings.show_claude_code,
             settings.show_codex,
@@ -3356,21 +3384,22 @@ pub fn run() {
             settings.show_grok,
             settings.show_copilot,
         );
-        let hwnd = CreateWindowExW(
-            WS_EX_TOOLWINDOW | WS_EX_LAYERED | WS_EX_NOACTIVATE,
-            PCWSTR::from_raw(class_name.as_ptr()),
-            PCWSTR::from_raw(title.as_ptr()),
-            WS_POPUP,
-            0,
-            0,
+        let visual_hwnd = create_visual_window(
+            language,
             total_widget_width_for(initial_model_count, language, settings.appearance),
-            sc(WIDGET_HEIGHT),
-            HWND::default(),
-            HMENU::default(),
-            hinstance,
-            None,
         )
         .unwrap();
+
+        // This hidden top-level window owns all application services and survives
+        // destruction of Explorer's taskbar children.
+        let broadcast_title = native_interop::wide_str("Quota Usage taskbar monitor");
+        let hwnd = CreateWindowExW(
+            WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
+            PCWSTR::from_raw(class_name.as_ptr()),
+            PCWSTR::from_raw(broadcast_title.as_ptr()),
+            WS_POPUP, 0, 0, 1, 1,
+            HWND::default(), HMENU::default(), hinstance, None,
+        ).expect("failed to create the application controller window");
 
         if !large_icon.is_invalid() {
             let _ = SendMessageW(
@@ -3396,7 +3425,7 @@ pub fn run() {
             let mut state = lock_state();
             *state = Some(AppState {
                 hwnd: SendHwnd::from_hwnd(hwnd),
-                taskbar_broadcast_hwnd: None,
+                visual_hwnd: SendHwnd::from_hwnd(visual_hwnd),
                 taskbar_hwnd: None,
                 tray_notify_hwnd: None,
                 win_event_hook: None,
@@ -3487,29 +3516,6 @@ pub fn run() {
                 widget_visible: settings.widget_visible,
                 settings_pane_open: settings.settings_pane_open,
             });
-        }
-
-        // The taskbar widget becomes a WS_CHILD window after attachment and
-        // therefore no longer receives Explorer's top-level broadcasts. Keep
-        // a hidden top-level window alive to relay TaskbarCreated promptly.
-        let broadcast_title = native_interop::wide_str("Quota Usage taskbar monitor");
-        let broadcast_hwnd = CreateWindowExW(
-            WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
-            PCWSTR::from_raw(class_name.as_ptr()),
-            PCWSTR::from_raw(broadcast_title.as_ptr()),
-            WS_POPUP,
-            0,
-            0,
-            1,
-            1,
-            HWND::default(),
-            HMENU::default(),
-            hinstance,
-            None,
-        )
-        .expect("failed to create the taskbar broadcast receiver window");
-        if let Some(state) = lock_state().as_mut() {
-            state.taskbar_broadcast_hwnd = Some(broadcast_hwnd);
         }
 
         let transitioned = startup_target
@@ -3682,7 +3688,7 @@ fn update_quota_tooltips() {
                 }
                 // Match the compact provider columns used by paint_content,
                 // rather than the worst-case width reserved by the window.
-                let dc = unsafe { GetDC(s.hwnd.to_hwnd()) };
+                let dc = unsafe { GetDC(s.visual_hwnd.to_hwnd()) };
                 let text_width = (if s.show_session_window {
                     usage_value_width(dc, session, s.appearance)
                 } else {
@@ -3694,7 +3700,7 @@ fn update_quota_tooltips() {
                     0
                 });
                 unsafe {
-                    ReleaseDC(s.hwnd.to_hwnd(), dc);
+                    ReleaseDC(s.visual_hwnd.to_hwnd(), dc);
                 }
                 let width =
                     model_usage_width(row_bar_segment_count(count), text_width, s.appearance);
@@ -3728,158 +3734,25 @@ fn update_quota_tooltips() {
                 left += width + s.appearance.provider_spacing.scaled_gap();
             }
         }
-        (s.hwnd.to_hwnd(), regions)
+        (s.visual_hwnd.to_hwnd(), regions)
     };
     quota_tooltip::sync(hwnd, regions);
-}
-
-/// Probe alternate UpdateLayeredWindow call shapes once on a diagnostic run.
-fn probe_layered_update_variants(
-    hwnd: HWND,
-    parent: HWND,
-    screen_rect: RECT,
-    parent_client_dst: POINT,
-    size: SIZE,
-    source_dc: HDC,
-    source_pt: POINT,
-    blend: &BLENDFUNCTION,
-) -> bool {
-    static PROBED: AtomicBool = AtomicBool::new(false);
-    if !diagnose::is_enabled() || PROBED.load(Ordering::Relaxed) {
-        return false;
-    }
-
-    #[derive(Clone, Copy)]
-    enum DestinationDc {
-        None,
-        Screen,
-        Parent,
-    }
-
-    let screen_dst = POINT {
-        x: screen_rect.left,
-        y: screen_rect.top,
-    };
-    let screen_dc = unsafe { GetDC(HWND::default()) };
-    let parent_dc = unsafe { GetDC(parent) };
-    let variants = [
-        ("null-point-size", None, Some(size), DestinationDc::None),
-        ("null-point-null-size", None, None, DestinationDc::None),
-        (
-            "screen-point-null-dc",
-            Some(screen_dst),
-            Some(size),
-            DestinationDc::None,
-        ),
-        (
-            "screen-point-screen-dc",
-            Some(screen_dst),
-            Some(size),
-            DestinationDc::Screen,
-        ),
-        (
-            "parent-point-parent-dc",
-            Some(parent_client_dst),
-            Some(size),
-            DestinationDc::Parent,
-        ),
-        (
-            "parent-point-screen-dc",
-            Some(parent_client_dst),
-            Some(size),
-            DestinationDc::Screen,
-        ),
-        (
-            "screen-point-parent-dc",
-            Some(screen_dst),
-            Some(size),
-            DestinationDc::Parent,
-        ),
-    ];
-
-    let mut recovered = false;
-    for (label, destination, update_size, destination_dc) in variants {
-        let hdc_dst = match destination_dc {
-            DestinationDc::None => HDC::default(),
-            DestinationDc::Screen if !screen_dc.is_invalid() => screen_dc,
-            DestinationDc::Parent if !parent_dc.is_invalid() => parent_dc,
-            _ => {
-                diagnose::log(format!(
-                    "layered diagnostic variant {label}: destination DC unavailable"
-                ));
-                continue;
-            }
-        };
-        if !native_interop::reset_layered_surface(hwnd) {
-            diagnose::log(format!("layered diagnostic variant {label}: surface reset failed"));
-            continue;
-        }
-        if PROBED.swap(true, Ordering::Relaxed) {
-            diagnose::log("layered diagnostic probe already claimed by another render");
-            break;
-        }
-        let result = unsafe {
-            UpdateLayeredWindow(
-                hwnd,
-                hdc_dst,
-                destination.as_ref().map(|point| point as *const POINT),
-                update_size.as_ref().map(|size| size as *const SIZE),
-                source_dc,
-                Some(&source_pt),
-                COLORREF(0),
-                Some(blend),
-                ULW_ALPHA,
-            )
-        };
-        match result {
-            Ok(()) => {
-                diagnose::log(format!("layered diagnostic variant {label}: succeeded"));
-                recovered = true;
-            }
-            Err(error) => diagnose::log(format!(
-                "layered diagnostic variant {label} failed: {error}"
-            )),
-        }
-
-        if destination.is_some() {
-            let restored = native_interop::position_window(
-                hwnd,
-                Some(parent),
-                native_interop::WindowPosition {
-                    x: parent_client_dst.x,
-                    y: parent_client_dst.y,
-                    width: size.cx,
-                    height: size.cy,
-                },
-            );
-            diagnose::log(format!(
-                "layered diagnostic variant {label}: restored position={restored}"
-            ));
-        }
-        if recovered {
-            break;
-        }
-    }
-
-    unsafe {
-        if !screen_dc.is_invalid() {
-            let _ = ReleaseDC(HWND::default(), screen_dc);
-        }
-        if !parent_dc.is_invalid() {
-            let _ = ReleaseDC(parent, parent_dc);
-        }
-    }
-    recovered
 }
 
 /// Render opaque taskbar content with ClearType via UpdateLayeredWindow.
 fn render_layered() {
     refresh_dpi();
     update_quota_tooltips();
+    let _ = render_layered_to(None);
+}
+
+// A candidate must submit pixels successfully before it becomes the live visual.
+// Do not update tooltips or resolve the target HWND through STATE here.
+fn render_layered_to(target: Option<HWND>) -> bool {
     let (
         hwnd_val,
         is_dark,
-        embedded,
+        _embedded,
         language,
         appearance,
         strings,
@@ -3929,7 +3802,7 @@ fn render_layered() {
                     std::array::from_fn(|index| provider_display(s, ProviderId::ALL[index]));
                 let visibility = effective_provider_visibility(s);
                 (
-                    s.hwnd,
+                    s.visual_hwnd,
                     s.is_dark,
                     s.embedded,
                     s.language,
@@ -3975,19 +3848,13 @@ fn render_layered() {
                     s.show_weekly_window,
                 )
             }
-            None => return,
+            None => {
+                return false;
+            }
         }
     };
 
-    let hwnd = hwnd_val.to_hwnd();
-
-    // For non-embedded fallback, just invalidate and let WM_PAINT handle it
-    if !embedded {
-        unsafe {
-            let _ = InvalidateRect(hwnd, None, false);
-        }
-        return;
-    }
+    let hwnd = target.unwrap_or(hwnd_val.to_hwnd());
 
     let mut client_rect = RECT::default();
     unsafe {
@@ -3996,7 +3863,7 @@ fn render_layered() {
     let width = client_rect.right - client_rect.left;
     let height = client_rect.bottom - client_rect.top;
     if width <= 0 || height <= 0 {
-        return;
+        return false;
     }
 
     let accent = custom_color(appearance.claude_accent, claude_accent_color());
@@ -4035,7 +3902,7 @@ fn render_layered() {
                 let _ = DeleteObject(dib);
             }
             let _ = DeleteDC(mem_dc);
-            return;
+            return false;
         }
 
         let old_bmp = SelectObject(mem_dc, dib);
@@ -4128,32 +3995,20 @@ fn render_layered() {
             }
         }
 
-        // Keep the layered surface dimensions and position explicit. For this
-        // child HWND, UpdateLayeredWindow's destination point is parent-client
-        // relative; passing GetWindowRect's screen coordinates moves it offscreen.
+        // Keep dimensions explicit, but preserve position established by SetWindowPos.
+        // UpdateLayeredWindow uses screen coordinates for non-null destinations.
         let Some(window_rect) = native_interop::get_window_rect_safe(hwnd) else {
             diagnose::log("widget layered surface update skipped: unable to query window rect");
             cleanup();
-            return;
+            return false;
         };
-        let Some(parent) = GetParent(hwnd).ok().filter(|parent| !parent.is_invalid()) else {
-            diagnose::log("widget layered surface update skipped: unable to query parent");
-            cleanup();
-            return;
-        };
-        let Some(pt_dst) =
-            native_interop::screen_to_client(parent, window_rect.left, window_rect.top)
-        else {
-            diagnose::log(
-                "widget layered surface update skipped: unable to map window origin to parent",
-            );
-            cleanup();
-            return;
-        };
+        let parent = GetParent(hwnd).unwrap_or_default();
+        let pt_dst = native_interop::screen_to_client(parent, window_rect.left, window_rect.top)
+            .unwrap_or(POINT { x: window_rect.left, y: window_rect.top });
         if diagnose::is_enabled() {
             let selected_bitmap = GetCurrentObject(mem_dc, OBJ_BITMAP);
             diagnose::log(format!(
-                "layered update inputs: hwnd={hwnd:?} parent={parent:?} screen_rect=({},{}-{},{}), parent_client_dst=({},{}), size={}x{}, rows=session:{show_session_window} weekly:{show_weekly_window}, hdc_dst=None hdc_src={mem_dc:?} gdi_flush={gdi_flush_succeeded} selected_bitmap={selected_bitmap:?} dib={dib:?} bitmap_selected={} bitmap_type={} style={:#x} exstyle={:#x}",
+                "layered update inputs: hwnd={hwnd:?} parent={parent:?} screen_rect=({},{}-{},{}), parent_client_origin=({},{}), destination=NULL (preserve position), size={}x{}, rows=session:{show_session_window} weekly:{show_weekly_window}, hdc_dst=None hdc_src={mem_dc:?} gdi_flush={gdi_flush_succeeded} selected_bitmap={selected_bitmap:?} dib={dib:?} bitmap_selected={} bitmap_type={} style={:#x} exstyle={:#x}",
                 window_rect.left,
                 window_rect.top,
                 window_rect.right,
@@ -4183,7 +4038,7 @@ fn render_layered() {
         let rendered = UpdateLayeredWindow(
             hwnd,
             None,
-            Some(&pt_dst),
+            None,
             Some(&sz),
             mem_dc,
             Some(&pt_src),
@@ -4191,47 +4046,17 @@ fn render_layered() {
             Some(&blend),
             ULW_ALPHA,
         );
+        let succeeded = rendered.is_ok();
         if let Err(error) = rendered {
-            diagnose::log_error("widget layered surface update failed; resetting surface", error);
-            // SetLayeredWindowAttributes locks out per-pixel updates until the
-            // layered style is reset. Recover without changing attachment or
-            // desired visibility, and retry with the already-rendered bitmap.
-            let mut recovered = false;
-            if native_interop::reset_layered_surface(hwnd) {
-                if let Err(error) = UpdateLayeredWindow(
-                    hwnd, None, Some(&pt_dst), Some(&sz), mem_dc, Some(&pt_src),
-                    COLORREF(0), Some(&blend), ULW_ALPHA,
-                ) {
-                    diagnose::log_error("widget layered surface recovery failed", error);
-                } else {
-                    recovered = true;
-                }
-            }
-            if !recovered {
-                recovered = probe_layered_update_variants(
-                    hwnd,
-                    parent,
-                    window_rect,
-                    pt_dst,
-                    sz,
-                    mem_dc,
-                    pt_src,
-                    &blend,
-                );
-            }
-            if recovered {
-                note_layered_render_succeeded();
-            } else {
-                // Keep the process alive when the HWND's DWM surface remains
-                // unavailable after the in-process recovery attempt.
-                note_layered_render_failed();
-            }
+            diagnose::log_error("widget layered surface update failed; retaining window", error);
+            note_layered_render_failed();
         } else {
             note_layered_render_succeeded();
         }
 
         // Cleanup
         cleanup();
+        succeeded
     }
 }
 
@@ -5042,7 +4867,7 @@ fn position_at_taskbar_with_save(save_offset: bool) {
         }
 
         (
-            s.hwnd.to_hwnd(),
+            s.visual_hwnd.to_hwnd(),
             s.embedded,
             s.tray_offset,
             s.anchor_left,
@@ -5256,23 +5081,100 @@ fn recover_polling(hwnd: HWND, network: bool) {
     }
 }
 
-/// Retry widget surface recovery after Windows and the shell have resumed.
-/// The immediate power notification can arrive before Explorer/DWM is ready.
-fn recover_wake_surface(hwnd: HWND) {
-    if MONITOR_TRANSITION_IN_PROGRESS.load(Ordering::Acquire) {
+fn schedule_wake_recovery(hwnd: HWND, delay_ms: u32) {
+    unsafe {
+        let _ = SetTimer(hwnd, TIMER_WAKE_RECOVERY, delay_ms, None);
+    }
+}
+
+fn request_visual_recovery(hwnd: HWND, manual: bool) {
+    let hwnd = controller_window(hwnd);
+    let (dragging, shutting_down) = {
+        let state = lock_state();
+        let Some(s) = state.as_ref() else { return; };
+        (s.dragging, matches!(s.update_status, UpdateStatus::Applying))
+    };
+    if shutting_down || EXIT_IN_PROGRESS.load(Ordering::Acquire)
+        || UNINSTALL_IN_PROGRESS.load(Ordering::Acquire)
+    {
+        return;
+    }
+    if dragging || MONITOR_TRANSITION_IN_PROGRESS.load(Ordering::Acquire) {
         unsafe {
-            let _ = SetTimer(hwnd, TIMER_WAKE_RECOVERY, 1_000, None);
+            let timer = if manual {
+                TIMER_MANUAL_WAKE_RECOVERY
+            } else {
+                TIMER_WAKE_RECOVERY
+            };
+            let _ = SetTimer(hwnd, timer, 1_000, None);
         }
         return;
     }
-
-    let placement = refresh_monitor_selection(hwnd);
-    if placement.reposition {
-        position_at_taskbar();
+    if let Err(message) = replace_visual_window(hwnd) {
+        diagnose::log(format!("widget visual recovery failed: {message}"));
+        if manual {
+            show_error_message(hwnd, "Restore widget display", &message);
+        }
     }
-    let reset = native_interop::reset_layered_surface(hwnd);
-    diagnose::log(format!("wake recovery: layered surface reset={reset}"));
-    render_layered();
+}
+
+fn replace_visual_window(controller: HWND) -> Result<(), String> {
+    let (old, language, device, offset, anchor_left) = {
+        let state = lock_state();
+        let s = state.as_ref().ok_or("Application state unavailable")?;
+        (s.visual_hwnd.to_hwnd(), s.language,
+            s.effective_monitor_device.clone().or_else(|| s.monitor_device.clone()),
+            s.tray_offset, s.anchor_left)
+    };
+    let monitors = native_interop::find_monitors();
+    let taskbars = native_interop::find_taskbars();
+    let target = resolve_monitor_target(&monitors, &taskbars, device.as_deref(), None)
+        .ok_or("No active display is available")?;
+    let _transition = MonitorTransitionGuard::new(controller)
+        .ok_or("A monitor transition is in progress")?;
+    let previous_dpi = CURRENT_DPI.load(Ordering::Relaxed);
+    let candidate = create_visual_window(language, total_widget_width())
+        .map_err(|error| format!("Unable to create widget: {error}"))?;
+    let prepared = place_visual_window(candidate, &target, offset, anchor_left);
+    let rendered = prepared.is_some() && render_layered_to(Some(candidate));
+    let can_commit = {
+        let state = lock_state();
+        state.as_ref().is_some_and(|s| s.visual_hwnd.to_hwnd() == old
+            && !s.dragging && !matches!(s.update_status, UpdateStatus::Applying))
+            && !EXIT_IN_PROGRESS.load(Ordering::Acquire)
+            && !UNINSTALL_IN_PROGRESS.load(Ordering::Acquire)
+    };
+    if !rendered || !can_commit || !unsafe { IsWindow(candidate).as_bool() } {
+        unsafe { let _ = DestroyWindow(candidate); }
+        CURRENT_DPI.store(previous_dpi, Ordering::Relaxed);
+        return Err("The replacement widget could not be drawn; the previous widget was retained.".into());
+    }
+
+    // Clear tooltip subclass/ownership while its old HWND still exists. Neither
+    // this cleanup nor native hook operations may run while STATE is locked.
+    quota_tooltip::clear();
+    if let Some(s) = lock_state().as_mut() {
+        s.visual_hwnd = SendHwnd::from_hwnd(candidate);
+    }
+    commit_visual_placement(&target, prepared.unwrap());
+    unsafe { let _ = DestroyWindow(old); }
+    update_quota_tooltips();
+    apply_configured_widget_visibility(controller);
+    diagnose::log(format!("widget visual replaced: controller={controller:?} old={old:?} new={candidate:?}"));
+    Ok(())
+}
+
+/// Raise only the transient tooltip, never its owner, above topmost windows.
+unsafe fn raise_transient_tooltip(tip: HWND) {
+    let _ = SetWindowPos(
+        tip,
+        HWND_TOPMOST,
+        0,
+        0,
+        0,
+        0,
+        SWP_NOACTIVATE | SWP_NOMOVE | SWP_NOSIZE | SWP_NOOWNERZORDER,
+    );
 }
 
 /// Main window procedure
@@ -5283,48 +5185,43 @@ unsafe extern "system" fn wnd_proc(
     lparam: LPARAM,
 ) -> LRESULT {
     let taskbar_created = taskbar_created_message();
-    if taskbar_created != 0 && msg == taskbar_created {
-        let (main_hwnd, broadcast_hwnd) = {
-            let state = lock_state();
-            state.as_ref().map_or((None, None), |app_state| {
-                (
-                    Some(app_state.hwnd.to_hwnd()),
-                    app_state.taskbar_broadcast_hwnd,
-                )
-            })
-        };
-        if let Some(main_hwnd) = main_hwnd {
-            if broadcast_hwnd == Some(hwnd) {
-                let _ = PostMessageW(main_hwnd, WM_APP_TASKBAR_CREATED, WPARAM(0), LPARAM(0));
-            } else if main_hwnd == hwnd {
-                if MONITOR_TRANSITION_IN_PROGRESS.load(Ordering::Acquire) {
-                    PENDING_TASKBAR_REFRESH.store(true, Ordering::Release);
-                } else {
-                    sync_tray_icons(hwnd);
-                    let placement = refresh_monitor_selection(hwnd);
-                    if placement.reposition {
-                        position_at_taskbar();
-                    }
-                    render_layered();
-                }
+    let windows = {
+        let state = lock_state();
+        state.as_ref().map(|s| (s.hwnd.to_hwnd(), s.visual_hwnd.to_hwnd()))
+    };
+    let Some((controller, visual)) = windows else {
+        // Unregistered windows carry no STATE, but a TTN_SHOW tooltip raise is
+        // transient and never mutates app state, so it stays safe here.
+        if msg == WM_NOTIFY && lparam.0 != 0 {
+            let notification = &*(lparam.0 as *const NMHDR);
+            if notification.code == TTN_SHOW {
+                raise_transient_tooltip(notification.hwndFrom);
+                return LRESULT(0);
             }
+        }
+        return DefWindowProcW(hwnd, msg, wparam, lparam);
+    };
+    if taskbar_created != 0 && msg == taskbar_created {
+        if hwnd == controller {
+            let _ = PostMessageW(controller, WM_APP_TASKBAR_CREATED, WPARAM(0), LPARAM(0));
         }
         return LRESULT(0);
     }
-    let (is_broadcast_receiver, broadcast_main) = {
-        let state = lock_state();
-        let state = state.as_ref();
-        (
-            state.is_some_and(|state| state.taskbar_broadcast_hwnd == Some(hwnd)),
-            state.map(|state| state.hwnd.to_hwnd()),
-        )
-    };
-    if is_broadcast_receiver {
-        if matches!(msg, WM_DISPLAYCHANGE | WM_SETTINGCHANGE) {
-            if let Some(main) = broadcast_main {
-                let _ = SendMessageW(main, msg, wparam, lparam);
-            }
+    // Candidate and retired visuals cannot mutate app state through synchronous
+    // creation/destruction/placement messages. Only the controller owns lifetime.
+    if hwnd != controller && hwnd != visual {
+        return DefWindowProcW(hwnd, msg, wparam, lparam);
+    }
+    let visual_message = matches!(msg, WM_NOTIFY | WM_PAINT | WM_ERASEBKGND
+        | WM_DPICHANGED_MSG | WM_SETCURSOR | WM_LBUTTONDOWN | WM_MOUSEMOVE
+        | WM_LBUTTONUP | WM_RBUTTONUP | WM_KEYDOWN | WM_CAPTURECHANGED);
+    if hwnd == visual && !visual_message {
+        if matches!(msg, WM_COMMAND | settings_ui::WM_SETTINGS | WM_APP_MONITOR_REFRESH) {
+            return SendMessageW(controller, msg, wparam, lparam);
         }
+        return DefWindowProcW(hwnd, msg, wparam, lparam);
+    }
+    if hwnd == controller && visual_message {
         return DefWindowProcW(hwnd, msg, wparam, lparam);
     }
     match msg {
@@ -5334,36 +5231,16 @@ unsafe extern "system" fn wnd_proc(
                 // A tooltip owned by an embedded child must be above the
                 // taskbar too. Raise only the transient tip when it appears,
                 // never the widget or its Explorer parent on refresh.
-                let _ = SetWindowPos(
-                    notification.hwndFrom,
-                    HWND_TOPMOST,
-                    0,
-                    0,
-                    0,
-                    0,
-                    SWP_NOACTIVATE | SWP_NOMOVE | SWP_NOSIZE | SWP_NOOWNERZORDER,
-                );
+                raise_transient_tooltip(notification.hwndFrom);
                 return LRESULT(0);
             }
             DefWindowProcW(hwnd, msg, wparam, lparam)
         }
         WM_PAINT => {
-            // For non-embedded fallback, paint normally
-            let embedded = {
-                let state = lock_state();
-                state.as_ref().map(|s| s.embedded).unwrap_or(false)
-            };
-            if embedded {
-                // Layered windows don't use WM_PAINT; just validate the region
-                let mut ps = PAINTSTRUCT::default();
-                let _ = BeginPaint(hwnd, &mut ps);
-                let _ = EndPaint(hwnd, &ps);
-            } else {
-                let mut ps = PAINTSTRUCT::default();
-                let hdc = BeginPaint(hwnd, &mut ps);
-                paint(hdc, hwnd);
-                let _ = EndPaint(hwnd, &ps);
-            }
+            // Embedded and floating visuals both use per-pixel layered drawing.
+            let mut ps = PAINTSTRUCT::default();
+            let _ = BeginPaint(hwnd, &mut ps);
+            let _ = EndPaint(hwnd, &ps);
             LRESULT(0)
         }
         WM_ERASEBKGND => LRESULT(1),
@@ -5376,8 +5253,8 @@ unsafe extern "system" fn wnd_proc(
             if wparam.0 == PBT_APMRESUMEAUTOMATIC as usize
                 || wparam.0 == PBT_APMRESUMESUSPEND as usize =>
         {
+            schedule_wake_recovery(hwnd, 5_000);
             recover_polling(hwnd, false);
-            let _ = SetTimer(hwnd, TIMER_WAKE_RECOVERY, 2_000, None);
             LRESULT(1)
         }
         _ if msg == recovery_events::MESSAGE => {
@@ -5440,7 +5317,11 @@ unsafe extern "system" fn wnd_proc(
                 }
                 TIMER_WAKE_RECOVERY => {
                     let _ = KillTimer(hwnd, TIMER_WAKE_RECOVERY);
-                    recover_wake_surface(hwnd);
+                    request_visual_recovery(hwnd, false);
+                }
+                TIMER_MANUAL_WAKE_RECOVERY => {
+                    let _ = KillTimer(hwnd, TIMER_MANUAL_WAKE_RECOVERY);
+                    request_visual_recovery(hwnd, true);
                 }
                 TIMER_FRESHNESS => {
                     update_display();
@@ -5561,6 +5442,7 @@ unsafe extern "system" fn wnd_proc(
                 s.drag_start_client_x = client_x;
                 s.drag_start_offset = s.tray_offset;
             }
+            drop(state);
             SetCapture(hwnd);
             LRESULT(0)
         }
@@ -5571,7 +5453,7 @@ unsafe extern "system" fn wnd_proc(
                 let state = lock_state();
                 state.as_ref().and_then(|s| {
                     s.dragging.then_some((
-                        s.hwnd.to_hwnd(),
+                        s.visual_hwnd.to_hwnd(),
                         s.drag_start_mouse_x,
                         s.drag_start_offset,
                         s.embedded,
@@ -5708,7 +5590,7 @@ unsafe extern "system" fn wnd_proc(
                                 }
                                 diagnose::log("taskbar drop could not be embedded; retaining old placement and retrying");
                                 unsafe {
-                                    let _ = SetTimer(hwnd, TIMER_TASKBAR_RETRY, 2_000, None);
+                                    let _ = SetTimer(controller, TIMER_TASKBAR_RETRY, 2_000, None);
                                 }
                             }
                         }
@@ -5727,7 +5609,7 @@ unsafe extern "system" fn wnd_proc(
         }
         WM_RBUTTONUP => {
             diagnose::log("context menu requested from widget");
-            show_context_menu(hwnd);
+            show_context_menu(controller);
             LRESULT(0)
         }
         settings_ui::WM_SETTINGS => {
@@ -5757,6 +5639,7 @@ unsafe extern "system" fn wnd_proc(
             LRESULT(0)
         }
         WM_DESTROY => {
+            EXIT_IN_PROGRESS.store(true, Ordering::Release);
             let (is_main_window, watch, hook, broadcast_hwnd) = {
                 let mut state = lock_state();
                 match state.as_mut() {
@@ -5764,7 +5647,7 @@ unsafe extern "system" fn wnd_proc(
                         true,
                         app_state.recovery_watch.take(),
                         app_state.win_event_hook,
-                        app_state.taskbar_broadcast_hwnd.take(),
+                        Some(app_state.visual_hwnd.to_hwnd()),
                     ),
                     _ => (false, None, None, None),
                 }
@@ -5777,8 +5660,8 @@ unsafe extern "system" fn wnd_proc(
             if let Some(h) = hook {
                 native_interop::unhook_win_event(h);
             }
-            if let Some(broadcast_hwnd) = broadcast_hwnd {
-                let _ = DestroyWindow(broadcast_hwnd);
+            if let Some(visual_hwnd) = broadcast_hwnd {
+                let _ = DestroyWindow(visual_hwnd);
             }
             tray_icon::remove_all(hwnd);
             settings_ui::shutdown();
@@ -5846,8 +5729,31 @@ fn show_settings_menu(hwnd: HWND) {
                     "Show widget"
                 },
             ),
+            (IDM_RESTORE_WIDGET_DISPLAY, "Restore widget display"),
+        ] {
+            let text = native_interop::wide_str(label);
+            let _ = AppendMenuW(
+                menu,
+                MF_STRING,
+                usize::from(id),
+                PCWSTR::from_raw(text.as_ptr()),
+            );
+        }
+        let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
+        for (id, label) in [
             (IDM_SETTINGS, strings.settings),
             (IDM_APPEARANCE_PAGE, "Appearance"),
+        ] {
+            let text = native_interop::wide_str(label);
+            let _ = AppendMenuW(
+                menu,
+                MF_STRING,
+                usize::from(id),
+                PCWSTR::from_raw(text.as_ptr()),
+            );
+        }
+        let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
+        for (id, label) in [
             (IDM_ABOUT_STAR, "About"),
             (2, strings.exit),
         ] {
@@ -7610,6 +7516,9 @@ fn apply_settings_action(hwnd: HWND, action: Action) -> Result<(), String> {
         Action::ResetColors => IDM_COLOR_RESET,
         Action::ResetPosition => IDM_RESET_POSITION,
         Action::Exit => {
+            if !claim_exit() {
+                return Err("An update, restart, or uninstall is already in progress.".into());
+            }
             unsafe {
                 let _ = PostMessageW(hwnd, WM_CLOSE, WPARAM(0), LPARAM(0));
             }
@@ -7640,195 +7549,19 @@ fn apply_settings_action(hwnd: HWND, action: Action) -> Result<(), String> {
     Ok(())
 }
 
-fn paint(hdc: HDC, hwnd: HWND) {
-    let (
-        is_dark,
-        appearance,
-        language,
-        strings,
-        session_pct,
-        session_text,
-        weekly_pct,
-        weekly_text,
-        codex_session_pct,
-        codex_session_text,
-        codex_weekly_pct,
-        codex_weekly_text,
-        antigravity_session_pct,
-        antigravity_session_text,
-        antigravity_weekly_pct,
-        antigravity_weekly_text,
-        opencode_session_pct,
-        opencode_session_text,
-        opencode_weekly_pct,
-        opencode_weekly_text,
-        cursor_session_pct,
-        cursor_session_text,
-        cursor_weekly_pct,
-        cursor_weekly_text,
-        grok_session_pct,
-        grok_session_text,
-        grok_weekly_pct,
-        grok_weekly_text,
-        copilot_session_pct,
-        copilot_session_text,
-        copilot_weekly_pct,
-        copilot_weekly_text,
-        show_claude_code,
-        show_codex,
-        show_antigravity,
-        show_opencode,
-        show_cursor,
-        show_grok,
-        show_copilot,
-        show_provider_icons,
-        show_session_window,
-        show_weekly_window,
-    ) = {
-        let state = lock_state();
-        match state.as_ref() {
-            Some(s) => {
-                let display: [ProviderDisplay; 7] =
-                    std::array::from_fn(|index| provider_display(s, ProviderId::ALL[index]));
-                let visibility = effective_provider_visibility(s);
-                (
-                    s.is_dark,
-                    s.appearance,
-                    s.language,
-                    s.language.strings(),
-                    display[0].session_percent,
-                    display[0].session_text.clone(),
-                    display[0].weekly_percent,
-                    display[0].weekly_text.clone(),
-                    display[1].session_percent,
-                    display[1].session_text.clone(),
-                    display[1].weekly_percent,
-                    display[1].weekly_text.clone(),
-                    display[2].session_percent,
-                    display[2].session_text.clone(),
-                    display[2].weekly_percent,
-                    display[2].weekly_text.clone(),
-                    display[3].session_percent,
-                    display[3].session_text.clone(),
-                    display[3].weekly_percent,
-                    display[3].weekly_text.clone(),
-                    display[4].session_percent,
-                    display[4].session_text.clone(),
-                    display[4].weekly_percent,
-                    display[4].weekly_text.clone(),
-                    display[5].session_percent,
-                    display[5].session_text.clone(),
-                    display[5].weekly_percent,
-                    display[5].weekly_text.clone(),
-                    display[6].session_percent,
-                    display[6].session_text.clone(),
-                    display[6].weekly_percent,
-                    display[6].weekly_text.clone(),
-                    visibility[0],
-                    visibility[1],
-                    visibility[2],
-                    visibility[3],
-                    visibility[4],
-                    visibility[5],
-                    visibility[6],
-                    s.show_provider_icons,
-                    s.show_session_window,
-                    s.show_weekly_window,
-                )
-            }
-            None => return,
-        }
-    };
-
-    let accent = custom_color(appearance.claude_accent, claude_accent_color());
-    let (bg_color, text_color, track) = appearance_colors(appearance, is_dark);
-    let codex_accent = custom_color(
-        appearance.codex_accent,
-        provider_icons::codex_color(appearance.is_dark(is_dark)),
-    );
-    let antigravity_accent = antigravity_accent_color();
-    let opencode_accent = custom_color(appearance.opencode_accent, opencode_accent_color());
-    let cursor_accent = custom_color(appearance.cursor_accent, cursor_accent_color());
-    let grok_accent = custom_color(appearance.grok_accent, grok_accent_color());
-    let copilot_accent = custom_color(appearance.copilot_accent, copilot_accent_color());
-
-    unsafe {
-        let mut client_rect = RECT::default();
-        let _ = GetClientRect(hwnd, &mut client_rect);
-        let width = client_rect.right - client_rect.left;
-        let height = client_rect.bottom - client_rect.top;
-
-        if width <= 0 || height <= 0 {
-            return;
-        }
-
-        let mem_dc = CreateCompatibleDC(hdc);
-        let mem_bmp = CreateCompatibleBitmap(hdc, width, height);
-        let old_bmp = SelectObject(mem_dc, mem_bmp);
-
-        paint_content(
-            mem_dc,
-            width,
-            height,
-            is_dark,
-            appearance,
-            &bg_color,
-            &text_color,
-            &accent,
-            &track,
-            language,
-            strings,
-            session_pct,
-            &session_text,
-            weekly_pct,
-            &weekly_text,
-            codex_session_pct,
-            &codex_session_text,
-            codex_weekly_pct,
-            &codex_weekly_text,
-            antigravity_session_pct,
-            &antigravity_session_text,
-            antigravity_weekly_pct,
-            &antigravity_weekly_text,
-            opencode_session_pct,
-            &opencode_session_text,
-            opencode_weekly_pct,
-            &opencode_weekly_text,
-            cursor_session_pct,
-            &cursor_session_text,
-            cursor_weekly_pct,
-            &cursor_weekly_text,
-            grok_session_pct,
-            &grok_session_text,
-            grok_weekly_pct,
-            &grok_weekly_text,
-            copilot_session_pct,
-            &copilot_session_text,
-            copilot_weekly_pct,
-            &copilot_weekly_text,
-            show_claude_code,
-            show_codex,
-            show_antigravity,
-            show_opencode,
-            show_cursor,
-            show_grok,
-            show_copilot,
-            show_provider_icons,
-            show_session_window,
-            show_weekly_window,
-            &codex_accent,
-            &antigravity_accent,
-            &opencode_accent,
-            &cursor_accent,
-            &grok_accent,
-            &copilot_accent,
-        );
-
-        let _ = BitBlt(hdc, 0, 0, width, height, mem_dc, 0, 0, SRCCOPY);
-
-        SelectObject(mem_dc, old_bmp);
-        let _ = DeleteObject(mem_bmp);
-        let _ = DeleteDC(mem_dc);
+fn claim_exit() -> bool {
+    let state = lock_state();
+    if RESTART_IN_PROGRESS.load(Ordering::Acquire)
+        || UNINSTALL_IN_PROGRESS.load(Ordering::Acquire)
+        || EXIT_IN_PROGRESS.load(Ordering::Acquire)
+        || state.as_ref().is_some_and(|state| {
+            matches!(state.update_status, UpdateStatus::Checking | UpdateStatus::Applying)
+        })
+    {
+        false
+    } else {
+        EXIT_IN_PROGRESS.store(true, Ordering::Release);
+        true
     }
 }
 
@@ -10099,6 +9832,10 @@ mod tests {
 
 unsafe fn handle_command(hwnd: HWND, id: u16) {
     match id {
+        IDM_RESTORE_WIDGET_DISPLAY => {
+            let _ = KillTimer(hwnd, TIMER_MANUAL_WAKE_RECOVERY);
+            request_visual_recovery(hwnd, true);
+        }
         1 => {
             {
                 let mut state = lock_state();
@@ -10147,6 +9884,9 @@ unsafe fn handle_command(hwnd: HWND, id: u16) {
         }
         IDM_UNINSTALL => confirm_and_begin_uninstall(hwnd),
         2 => {
+            if !claim_exit() {
+                return;
+            }
             let hook = {
                 let state = lock_state();
                 state.as_ref().and_then(|s| s.win_event_hook)
