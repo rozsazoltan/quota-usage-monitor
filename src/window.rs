@@ -5820,7 +5820,7 @@ fn show_settings_menu(hwnd: HWND) {
         // unreliable while the widget lives inside Explorer's taskbar.
         let picked = TrackPopupMenuEx(
             menu,
-            TPM_RIGHTBUTTON.0 | TPM_RETURNCMD.0,
+            TPM_RETURNCMD.0,
             point.x,
             point.y,
             owner,
