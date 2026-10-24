@@ -5203,6 +5203,9 @@ unsafe extern "system" fn wnd_proc(
     };
     if taskbar_created != 0 && msg == taskbar_created {
         if hwnd == controller {
+            // Explorer broadcasts this after rebuilding its taskbar. Give the
+            // new shell windows time to settle, then replace the embedded view.
+            schedule_wake_recovery(controller, 1_000);
             let _ = PostMessageW(controller, WM_APP_TASKBAR_CREATED, WPARAM(0), LPARAM(0));
         }
         return LRESULT(0);
@@ -5352,20 +5355,25 @@ unsafe extern "system" fn wnd_proc(
         }
         WM_APP_TASKBAR_CREATED => {
             if wparam.0 == WATCHDOG_TASKBAR_REFRESH_WPARAM {
-                let attachment_matches = watchdog_window_snapshot().is_some_and(|snapshot| {
-                    snapshot.hwnd == hwnd
-                        && watchdog_attachment_matches(
-                            &snapshot,
-                            &native_interop::find_taskbars(),
-                            IsWindow(snapshot.hwnd).as_bool(),
-                        )
-                });
+                let Some(snapshot) = watchdog_window_snapshot() else {
+                    return LRESULT(0);
+                };
+                if snapshot.hwnd.0 as isize != lparam.0 {
+                    diagnose::log("skipping stale watchdog taskbar refresh; visual HWND changed");
+                    return LRESULT(0);
+                }
+                let attachment_matches = watchdog_attachment_matches(
+                    &snapshot,
+                    &native_interop::find_taskbars(),
+                    IsWindow(snapshot.hwnd).as_bool(),
+                );
                 if attachment_matches {
                     if diagnose::is_enabled() {
                         diagnose::log("skipping stale watchdog taskbar refresh; attachment matches");
                     }
                     return LRESULT(0);
                 }
+                schedule_wake_recovery(hwnd, 1_000);
             }
             if diagnose::is_enabled() {
                 diagnose::log(format!(
