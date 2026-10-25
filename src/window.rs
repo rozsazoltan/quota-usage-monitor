@@ -10,7 +10,9 @@ use windows::Win32::Foundation::*;
 use windows::Win32::Graphics::Gdi::*;
 use windows::Win32::System::LibraryLoader::{GetModuleFileNameW, GetModuleHandleW};
 use windows::Win32::System::Registry::*;
-use windows::Win32::System::Threading::{CreateMutexW, WaitForSingleObject};
+use windows::Win32::System::Threading::{
+    CreateMutexW, GetCurrentProcessId, GetCurrentThreadId, WaitForSingleObject,
+};
 use windows::Win32::UI::Accessibility::HWINEVENTHOOK;
 use windows::Win32::UI::Controls::{NMHDR, TTN_SHOW};
 use windows::Win32::UI::HiDpi::*;
@@ -5698,10 +5700,98 @@ unsafe extern "system" fn menu_owner_proc(
     wparam: WPARAM,
     lparam: LPARAM,
 ) -> LRESULT {
+    if msg == WM_ENTERIDLE && wparam.0 == MSGF_MENU as usize {
+        let candidate = HWND(lparam.0 as *mut _);
+        let active = MENU_ELEVATION_SESSION.with(|slot| {
+            let mut session = slot.borrow_mut();
+            let Some(session) = session.as_mut() else {
+                return None;
+            };
+            if session.helper != hwnd || session.attempted {
+                return None;
+            }
+            session.attempted = true;
+            Some((session.menu, session.id))
+        });
+        if let Some((menu, id)) = active {
+            let thread = GetCurrentThreadId();
+            let mut process = 0;
+            let candidate_thread = GetWindowThreadProcessId(candidate, Some(&mut process));
+            let valid_window = !candidate.is_invalid()
+                && IsWindow(candidate).as_bool()
+                && candidate_thread == thread
+                && process == GetCurrentProcessId();
+            let mut info = MENUBARINFO {
+                cbSize: std::mem::size_of::<MENUBARINFO>() as u32,
+                ..Default::default()
+            };
+            let valid_menu = valid_window
+                && GetMenuBarInfo(candidate, OBJID_CLIENT, 0, &mut info).is_ok()
+                && info.hMenu == menu;
+            let foreground = GetForegroundWindow();
+            let exstyle = GetWindowLongW(candidate, GWL_EXSTYLE);
+            let result = if valid_menu {
+                SetWindowPos(
+                    candidate,
+                    HWND_TOPMOST,
+                    0,
+                    0,
+                    0,
+                    0,
+                    SWP_NOACTIVATE | SWP_NOMOVE | SWP_NOSIZE | SWP_NOOWNERZORDER,
+                )
+                    .map(|_| "raised".to_string())
+                    .unwrap_or_else(|error| format!("raise-failed:{error}"))
+            } else {
+                "validation-failed".to_string()
+            };
+            diagnose::log(format!(
+                "context menu session={id} helper={hwnd:?} popup={candidate:?} foreground={foreground:?} exstyle={exstyle:#x} validation={} elevation={result}",
+                valid_menu
+            ));
+        }
+    }
     DefWindowProcW(hwnd, msg, wparam, lparam)
 }
 
+struct MenuElevationSession {
+    id: u64,
+    helper: HWND,
+    menu: HMENU,
+    attempted: bool,
+}
+
+thread_local! {
+    static MENU_ELEVATION_SESSION: std::cell::RefCell<Option<MenuElevationSession>> = const { std::cell::RefCell::new(None) };
+    static MENU_OPENING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+struct MenuOpeningGuard;
+
+impl MenuOpeningGuard {
+    fn acquire() -> Option<Self> {
+        MENU_OPENING.with(|active| {
+            if active.replace(true) {
+                None
+            } else {
+                Some(Self)
+            }
+        })
+    }
+}
+
+impl Drop for MenuOpeningGuard {
+    fn drop(&mut self) {
+        MENU_OPENING.with(|active| active.set(false));
+    }
+}
+
+static MENU_ELEVATION_SESSION_ID: AtomicU32 = AtomicU32::new(0);
+
 fn show_settings_menu(hwnd: HWND) {
+    let Some(_opening_guard) = MenuOpeningGuard::acquire() else {
+        return;
+    };
     let (strings, visible) = {
         let state = lock_state();
         let Some(s) = state.as_ref() else { return };
@@ -5814,9 +5904,20 @@ fn show_settings_menu(hwnd: HWND) {
         // TPM_RETURNCMD hands the picked item id back directly instead of
         // routing WM_COMMAND through the owner window, which proved
         // unreliable while the widget lives inside Explorer's taskbar.
+        let session_id = u64::from(
+            MENU_ELEVATION_SESSION_ID.fetch_add(1, Ordering::Relaxed).wrapping_add(1),
+        );
+        MENU_ELEVATION_SESSION.with(|slot| {
+            *slot.borrow_mut() = Some(MenuElevationSession {
+                id: session_id,
+                helper: owner,
+                menu,
+                attempted: false,
+            })
+        });
         let picked = TrackPopupMenuEx(
             menu,
-            TPM_NONOTIFY.0 | TPM_RETURNCMD.0,
+            TPM_RETURNCMD.0,
             point.x,
             point.y,
             owner,
@@ -5829,10 +5930,21 @@ fn show_settings_menu(hwnd: HWND) {
             picked.0,
             std::io::Error::last_os_error()
         ));
+        let attempted = MENU_ELEVATION_SESSION.with(|slot| {
+            slot.borrow_mut()
+                .take()
+                .is_some_and(|session| session.attempted)
+        });
+        if !attempted {
+            diagnose::log(format!(
+                "context menu session={session_id} helper={owner:?} missing WM_ENTERIDLE notification"
+            ));
+        }
         let _ = DestroyMenu(menu);
         if transient_owner {
             let _ = DestroyWindow(owner);
         }
+        drop(_opening_guard);
         if picked.0 != 0 {
             let _ = SendMessageW(hwnd, WM_COMMAND, WPARAM(picked.0 as usize), LPARAM(0));
         }

@@ -451,6 +451,7 @@ unsafe fn clear_stuck_topmost(hwnd: HWND) -> bool {
 }
 
 /// Clear incompatible constant-alpha state before retrying a per-pixel update.
+#[cfg(test)]
 pub fn reset_layered_surface(hwnd: HWND) -> bool {
     log_window_transition("surface reset begin", hwnd, None);
     unsafe {
@@ -545,6 +546,7 @@ pub fn reset_layered_surface(hwnd: HWND) -> bool {
 /// Change between an embedded child window and a floating popup, placing it in
 /// the coordinate space of its new parent. Native failures restore the prior
 /// parent, styles, rectangle, z-order, and visibility.
+#[cfg(test)]
 pub fn set_window_mode(hwnd: HWND, parent: Option<HWND>, position: WindowPosition) -> bool {
     set_window_mode_inner(hwnd, parent, position, true)
 }
