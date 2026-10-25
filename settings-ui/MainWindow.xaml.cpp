@@ -2598,14 +2598,6 @@ namespace winrt::SettingsUI::implementation
         return true;
     }
 
-    static bool IsValidAccountId(std::wstring const& id)
-    {
-        if (id.empty()) return false;
-        for (const auto ch : id)
-            if (!((ch >= L'a' && ch <= L'z') || (ch >= L'A' && ch <= L'Z') || (ch >= L'0' && ch <= L'9') || ch == L'_')) return false;
-        return true;
-    }
-
     static bool IsValidCredentialPath(std::wstring const& path)
     {
         if (path.empty() || path == L"~" || path.rfind(L"~/", 0) == 0 || path.rfind(L"~\\", 0) == 0) return true;
@@ -2639,15 +2631,35 @@ namespace winrt::SettingsUI::implementation
         UpdateSaveBar();
     }
 
+    static std::wstring SlugAccountId(std::wstring const& name)
+    {
+        std::wstring id;
+        for (const auto ch : name)
+        {
+            if (ch >= L'A' && ch <= L'Z') id.push_back(static_cast<wchar_t>(ch - L'A' + L'a'));
+            else if ((ch >= L'a' && ch <= L'z') || (ch >= L'0' && ch <= L'9')) id.push_back(ch);
+            else if (!id.empty() && id.back() != L'_') id.push_back(L'_');
+        }
+        while (!id.empty() && id.back() == L'_') id.pop_back();
+        if (id.empty()) id = L"account";
+        return id;
+    }
+
+    static std::wstring UniqueAccountId(JsonArray const& list, std::wstring const& base)
+    {
+        std::wstring candidate = base;
+        for (int suffix = 2; FindAccountProfile(list, candidate) >= 0; ++suffix)
+            candidate = base + L"_" + std::to_wstring(suffix);
+        return candidate;
+    }
+
     void MainWindow::BuildAccountsCard(StackPanel const& parent, std::wstring const& providerKey)
     {
         if (!parent) return;
         parent.Children().Clear();
-        auto providers = AccountProviders();
-        auto entry = providers.GetNamedObject(hstring(providerKey.c_str()), JsonObject());
+        auto entry = AccountProviders().GetNamedObject(hstring(providerKey.c_str()), JsonObject());
         auto profiles = entry.GetNamedArray(L"profiles", JsonArray());
         const auto defaultId = OptionalString(entry, L"default");
-        const auto selectedId = OptionalString(entry, L"selected");
         const auto secondary = Application::Current().Resources().Lookup(box_value(L"TextFillColorSecondaryBrush")).as<Media::Brush>();
         auto commit = [this, providerKey](JsonObject const& next)
         {
@@ -2656,13 +2668,13 @@ namespace winrt::SettingsUI::implementation
             if (accountEditorHost_) BuildAccountsCard(accountEditorHost_, providerKey);
         };
         auto card = Card();
-        auto stack = StackPanel(); stack.Spacing(10);
+        auto stack = StackPanel(); stack.Spacing(6);
         stack.Children().Append(Label(L"Accounts", 19));
-        auto note = Label(L"Profiles point at credential files the installed program already keeps. Secret values are never stored here.", 12);
-        note.Foreground(secondary); stack.Children().Append(note);
+        auto note = Label(NativeLocalization::Translate(L"The active account reads the credential files the installed program already keeps. No secrets are stored here.", g_nativeLanguage), 12);
+        note.Foreground(secondary); note.TextWrapping(TextWrapping::Wrap); stack.Children().Append(note);
         if (profiles.Size() == 0)
         {
-            auto empty = Label(L"No profiles yet. Add one to choose which local account this provider reads.", 12);
+            auto empty = Label(NativeLocalization::Translate(L"No accounts yet. Add one below.", g_nativeLanguage), 12);
             empty.Foreground(secondary); stack.Children().Append(empty);
         }
         for (uint32_t i = 0; i < profiles.Size(); ++i)
@@ -2672,41 +2684,46 @@ namespace winrt::SettingsUI::implementation
             const auto name = OptionalString(profile, L"name");
             const auto credentialsPath = OptionalString(profile, L"credentials");
             const auto configDir = OptionalString(profile, L"config_dir");
-            const bool enabled = profile.GetNamedBoolean(L"enabled", false);
-            const bool isDefault = !defaultId.empty() && SameAccountId(defaultId, id.c_str());
-            const bool isSelected = !selectedId.empty() && SameAccountId(selectedId, id.c_str());
-            auto row = StackPanel(); row.Spacing(6); row.Padding(Thickness{ 0, 8, 0, 8 });
-            auto headerRow = StackPanel(); headerRow.Orientation(Orientation::Horizontal); headerRow.Spacing(8);
-            auto enabledToggle = ToggleSwitch(); SetSwitchContent(enabledToggle);
-            enabledToggle.IsOn(enabled); enabledToggle.IsEnabled(!isDefault);
-            Microsoft::UI::Xaml::Automation::AutomationProperties::SetName(enabledToggle, NativeLocalization::Translate(L"Use this account", g_nativeLanguage));
-            Microsoft::UI::Xaml::Automation::AutomationProperties::SetAutomationId(enabledToggle, L"AccountEnabled_" + providerKey + L"_" + std::wstring(id));
-            headerRow.Children().Append(enabledToggle);
-            auto nameBox = TextBox(); nameBox.Text(hstring(name)); nameBox.Width(190); nameBox.MaxLength(80);
-            Microsoft::UI::Xaml::Automation::AutomationProperties::SetName(nameBox, NativeLocalization::Translate(L"Account name", g_nativeLanguage));
-            Microsoft::UI::Xaml::Automation::AutomationProperties::SetAutomationId(nameBox, L"AccountName_" + providerKey + L"_" + std::wstring(id));
-            headerRow.Children().Append(nameBox);
-            auto idLabel = Label(id.c_str(), 12); idLabel.VerticalAlignment(VerticalAlignment::Center); idLabel.Foreground(secondary);
-            headerRow.Children().Append(idLabel);
-            if (isDefault) headerRow.Children().Append(Label(L"Default", 12));
-            else if (isSelected) headerRow.Children().Append(Label(L"Selected", 12));
-            row.Children().Append(headerRow);
-            auto pathRow = StackPanel(); pathRow.Orientation(Orientation::Horizontal); pathRow.Spacing(8);
-            pathRow.SizeChanged([](auto const& sender, auto const&)
+            const bool isActive = !defaultId.empty() && SameAccountId(defaultId, id.c_str());
+            auto row = StackPanel(); row.Spacing(4); row.Padding(Thickness{ 0, 4, 0, 4 });
+            auto choice = RadioButton();
+            choice.GroupName(L"Accounts_" + providerKey);
+            choice.Content(box_value(hstring(name)));
+            choice.IsChecked(isActive);
+            Microsoft::UI::Xaml::Automation::AutomationProperties::SetAutomationId(choice, L"AccountActive_" + providerKey + L"_" + std::wstring(id));
+            row.Children().Append(choice);
+            choice.Checked([this, providerKey, id, isActive, commit](auto const&, auto const&)
             {
-                auto panel = sender.as<StackPanel>();
-                panel.Orientation(panel.ActualWidth() < 640 ? Orientation::Vertical : Orientation::Horizontal);
+                if (hydrating_ || isActive) return;
+                auto next = CloneJsonObject(AccountProviders());
+                auto accounts = next.GetNamedObject(hstring(providerKey.c_str()), JsonObject());
+                auto list = accounts.GetNamedArray(L"profiles", JsonArray());
+                const auto index = FindAccountProfile(list, id.c_str());
+                if (index < 0) return;
+                list.GetObjectAt(static_cast<uint32_t>(index)).Insert(L"enabled", JsonValue::CreateBooleanValue(true));
+                accounts.Insert(L"default", JsonValue::CreateStringValue(id.c_str()));
+                accounts.Insert(L"selected", JsonValue::CreateNullValue());
+                commit(next);
             });
-            auto credentialsBox = TextBox(); credentialsBox.Text(hstring(credentialsPath)); credentialsBox.Width(280);
-            credentialsBox.PlaceholderText(NativeLocalization::Translate(L"Credential file (default location)", g_nativeLanguage));
-            Microsoft::UI::Xaml::Automation::AutomationProperties::SetName(credentialsBox, NativeLocalization::Translate(L"Credential file", g_nativeLanguage));
+            auto details = Expander();
+            details.HorizontalAlignment(HorizontalAlignment::Stretch);
+            details.HorizontalContentAlignment(HorizontalAlignment::Stretch);
+            details.Header(box_value(hstring(NativeLocalization::Translate(isActive ? L"Active account files" : L"Account files", g_nativeLanguage))));
+            Microsoft::UI::Xaml::Automation::AutomationProperties::SetAutomationId(details, L"AccountDetails_" + providerKey + L"_" + std::wstring(id));
+            auto fields = StackPanel(); fields.Spacing(8);
+            auto nameBox = TextBox(); nameBox.Text(hstring(name)); nameBox.MaxLength(80);
+            nameBox.Header(box_value(hstring(NativeLocalization::Translate(L"Name", g_nativeLanguage))));
+            Microsoft::UI::Xaml::Automation::AutomationProperties::SetAutomationId(nameBox, L"AccountName_" + providerKey + L"_" + std::wstring(id));
+            fields.Children().Append(nameBox);
+            auto credentialsBox = TextBox(); credentialsBox.Text(hstring(credentialsPath));
+            credentialsBox.Header(box_value(hstring(NativeLocalization::Translate(L"Credential file", g_nativeLanguage))));
+            credentialsBox.PlaceholderText(NativeLocalization::Translate(L"Default location", g_nativeLanguage));
             Microsoft::UI::Xaml::Automation::AutomationProperties::SetAutomationId(credentialsBox, L"AccountCredentials_" + providerKey + L"_" + std::wstring(id));
-            auto configBox = TextBox(); configBox.Text(hstring(configDir)); configBox.Width(240);
-            configBox.PlaceholderText(NativeLocalization::Translate(L"Config folder (optional)", g_nativeLanguage));
-            Microsoft::UI::Xaml::Automation::AutomationProperties::SetName(configBox, NativeLocalization::Translate(L"Config folder", g_nativeLanguage));
+            fields.Children().Append(credentialsBox);
+            auto configBox = TextBox(); configBox.Text(hstring(configDir));
+            configBox.Header(box_value(hstring(NativeLocalization::Translate(L"Config folder (optional)", g_nativeLanguage))));
             Microsoft::UI::Xaml::Automation::AutomationProperties::SetAutomationId(configBox, L"AccountConfigDir_" + providerKey + L"_" + std::wstring(id));
-            pathRow.Children().Append(credentialsBox); pathRow.Children().Append(configBox);
-            row.Children().Append(pathRow);
+            fields.Children().Append(configBox);
             auto writeProfile = [this, providerKey, id, commit](std::wstring const& field, IJsonValue const& value)
             {
                 auto next = CloneJsonObject(AccountProviders());
@@ -2743,111 +2760,71 @@ namespace winrt::SettingsUI::implementation
                 if (!IsValidCredentialPath(edited)) { configBox.Text(hstring(configDir)); ShowMessage(L"Use an absolute path, or a path starting with ~.", true); return; }
                 writeProfile(L"config_dir", edited.empty() ? JsonValue::CreateNullValue() : JsonValue::CreateStringValue(edited));
             });
-            enabledToggle.Toggled([this, providerKey, enabled, id, isDefault, selectedId, commit](auto const& sender, auto const&)
+            if (isActive)
             {
-                if (hydrating_) return;
-                auto control = sender.as<ToggleSwitch>();
-                const bool nextEnabled = control.IsOn();
-                if (nextEnabled == enabled) return;
-                if (!nextEnabled && isDefault) { control.IsOn(true); ShowMessage(L"Choose another default account before turning this one off.", true); return; }
-                auto next = CloneJsonObject(AccountProviders());
-                auto accounts = next.GetNamedObject(hstring(providerKey.c_str()), JsonObject());
-                auto list = accounts.GetNamedArray(L"profiles", JsonArray());
-                const auto index = FindAccountProfile(list, id.c_str());
-                if (index < 0) return;
-                list.GetObjectAt(static_cast<uint32_t>(index)).Insert(L"enabled", JsonValue::CreateBooleanValue(nextEnabled));
-                if (!nextEnabled && !selectedId.empty() && SameAccountId(selectedId, id.c_str()))
-                    accounts.Insert(L"selected", JsonValue::CreateNullValue());
-                commit(next);
-            });
-            auto actions = StackPanel(); actions.Orientation(Orientation::Horizontal); actions.Spacing(8);
-            if (!isDefault)
+                auto keep = Label(NativeLocalization::Translate(L"The active account cannot be removed. Choose another account first.", g_nativeLanguage), 12);
+                keep.Foreground(secondary); keep.TextWrapping(TextWrapping::Wrap);
+                fields.Children().Append(keep);
+            }
+            else
             {
-                auto makeDefault = Button(); makeDefault.Content(box_value(NativeLocalization::Translate(L"Make default", g_nativeLanguage)));
-                Microsoft::UI::Xaml::Automation::AutomationProperties::SetAutomationId(makeDefault, L"AccountDefault_" + providerKey + L"_" + std::wstring(id));
-                makeDefault.Click([this, providerKey, id, enabled, commit](auto const&, auto const&)
+                auto remove = Button(); remove.Content(box_value(hstring(NativeLocalization::Translate(L"Remove account", g_nativeLanguage))));
+                Microsoft::UI::Xaml::Automation::AutomationProperties::SetAutomationId(remove, L"AccountRemove_" + providerKey + L"_" + std::wstring(id));
+                remove.Click([this, providerKey, id, commit](auto const&, auto const&)
                 {
-                    if (!enabled) { ShowMessage(L"Turn this account on before making it the default.", true); return; }
                     auto next = CloneJsonObject(AccountProviders());
                     auto accounts = next.GetNamedObject(hstring(providerKey.c_str()), JsonObject());
-                    accounts.Insert(L"default", JsonValue::CreateStringValue(id.c_str()));
+                    auto list = accounts.GetNamedArray(L"profiles", JsonArray());
+                    const auto index = FindAccountProfile(list, id.c_str());
+                    if (index < 0) return;
+                    list.RemoveAt(static_cast<uint32_t>(index));
+                    auto selected = OptionalString(accounts, L"selected");
+                    if (!selected.empty() && SameAccountId(selected, id.c_str())) accounts.Insert(L"selected", JsonValue::CreateNullValue());
                     commit(next);
                 });
-                actions.Children().Append(makeDefault);
+                fields.Children().Append(remove);
             }
-            auto select = Button();
-            select.Content(box_value(NativeLocalization::Translate(isSelected ? L"Follow default" : L"Select", g_nativeLanguage)));
-            Microsoft::UI::Xaml::Automation::AutomationProperties::SetAutomationId(select, L"AccountSelect_" + providerKey + L"_" + std::wstring(id));
-            select.Click([this, providerKey, id, isSelected, enabled, commit](auto const&, auto const&)
-            {
-                if (!isSelected && !enabled) { ShowMessage(L"Turn this account on before selecting it.", true); return; }
-                auto next = CloneJsonObject(AccountProviders());
-                auto accounts = next.GetNamedObject(hstring(providerKey.c_str()), JsonObject());
-                accounts.Insert(L"selected", isSelected ? JsonValue::CreateNullValue() : JsonValue::CreateStringValue(id.c_str()));
-                commit(next);
-            });
-            actions.Children().Append(select);
-            auto remove = Button(); remove.Content(box_value(NativeLocalization::Translate(L"Remove", g_nativeLanguage)));
-            Microsoft::UI::Xaml::Automation::AutomationProperties::SetAutomationId(remove, L"AccountRemove_" + providerKey + L"_" + std::wstring(id));
-            remove.Click([this, providerKey, id, isDefault, commit](auto const&, auto const&)
-            {
-                if (isDefault) { ShowMessage(L"Choose another default account before removing this one.", true); return; }
-                auto next = CloneJsonObject(AccountProviders());
-                auto accounts = next.GetNamedObject(hstring(providerKey.c_str()), JsonObject());
-                auto list = accounts.GetNamedArray(L"profiles", JsonArray());
-                const auto index = FindAccountProfile(list, id.c_str());
-                if (index < 0) return;
-                list.RemoveAt(static_cast<uint32_t>(index));
-                auto selected = OptionalString(accounts, L"selected");
-                if (!selected.empty() && SameAccountId(selected, id.c_str())) accounts.Insert(L"selected", JsonValue::CreateNullValue());
-                commit(next);
-            });
-            actions.Children().Append(remove);
-            row.Children().Append(actions);
-            auto separator = Border();
-            separator.Height(1); separator.Background(secondary); separator.Opacity(0.2);
-            stack.Children().Append(row); stack.Children().Append(separator);
+            details.Content(fields);
+            row.Children().Append(details);
+            stack.Children().Append(row);
         }
         auto addRow = StackPanel(); addRow.Orientation(Orientation::Horizontal); addRow.Spacing(8);
+        addRow.VerticalAlignment(VerticalAlignment::Bottom);
         addRow.SizeChanged([](auto const& sender, auto const&)
         {
             auto panel = sender.as<StackPanel>();
-            panel.Orientation(panel.ActualWidth() < 640 ? Orientation::Vertical : Orientation::Horizontal);
+            panel.Orientation(panel.ActualWidth() < 480 ? Orientation::Vertical : Orientation::Horizontal);
         });
-        auto newId = TextBox(); newId.Width(200); newId.MaxLength(48);
-        newId.PlaceholderText(NativeLocalization::Translate(L"Account ID", g_nativeLanguage));
-        Microsoft::UI::Xaml::Automation::AutomationProperties::SetAutomationId(newId, L"AccountNewId_" + providerKey);
-        auto newName = TextBox(); newName.Width(200); newName.MaxLength(80);
+        auto newName = TextBox(); newName.Width(240); newName.MaxLength(80);
+        newName.Header(box_value(hstring(NativeLocalization::Translate(L"Add account", g_nativeLanguage))));
         newName.PlaceholderText(NativeLocalization::Translate(L"Display name", g_nativeLanguage));
         Microsoft::UI::Xaml::Automation::AutomationProperties::SetAutomationId(newName, L"AccountNewName_" + providerKey);
-        auto add = Button(); add.Content(box_value(NativeLocalization::Translate(L"Add account", g_nativeLanguage)));
+        auto add = Button(); add.Content(box_value(hstring(NativeLocalization::Translate(L"Add", g_nativeLanguage))));
+        add.VerticalAlignment(VerticalAlignment::Bottom);
         Microsoft::UI::Xaml::Automation::AutomationProperties::SetAutomationId(add, L"AccountAdd_" + providerKey);
-        add.Click([this, providerKey, newId, newName, commit](auto const&, auto const&)
+        add.Click([this, providerKey, newName, commit](auto const&, auto const&)
         {
-            const auto id = std::wstring(newId.Text().c_str());
             auto name = std::wstring(newName.Text().c_str());
             while (!name.empty() && iswspace(name.front())) name.erase(name.begin());
             while (!name.empty() && iswspace(name.back())) name.pop_back();
-            if (!IsValidAccountId(id)) { ShowMessage(L"Account IDs use ASCII letters, digits, or underscores.", true); return; }
-            if (name.empty()) { ShowMessage(L"Enter a display name for the new account.", true); return; }
+            if (name.empty()) { ShowMessage(L"Enter a name for the new account.", true); return; }
             auto next = CloneJsonObject(AccountProviders());
             auto accounts = next.GetNamedObject(hstring(providerKey.c_str()), JsonObject());
             auto list = accounts.GetNamedArray(L"profiles", JsonArray());
-            if (FindAccountProfile(list, id) >= 0) { ShowMessage(L"That account ID is already used for this provider.", true); return; }
             auto profile = JsonObject();
-            profile.Insert(L"id", JsonValue::CreateStringValue(id.c_str()));
+            profile.Insert(L"id", JsonValue::CreateStringValue(UniqueAccountId(list, SlugAccountId(name)).c_str()));
             profile.Insert(L"name", JsonValue::CreateStringValue(name.c_str()));
             profile.Insert(L"config_dir", JsonValue::CreateNullValue());
             profile.Insert(L"credentials", JsonValue::CreateNullValue());
             profile.Insert(L"enabled", JsonValue::CreateBooleanValue(false));
             list.Append(profile);
             commit(next);
+            ShowMessage(L"Account added. Save, then choose it.");
         });
-        addRow.Children().Append(newId); addRow.Children().Append(newName); addRow.Children().Append(add);
+        addRow.Children().Append(newName); addRow.Children().Append(add);
         stack.Children().Append(addRow);
         card.Child(stack); parent.Children().Append(card);
     }
-
     void MainWindow::AddAccentColorRow(StackPanel const& parent, std::wstring const& key, std::wstring const& title)
     {
         const auto localizedTitle = NativeLocalization::Translate(title, g_nativeLanguage);
