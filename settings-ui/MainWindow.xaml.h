@@ -92,6 +92,9 @@ namespace winrt::SettingsUI::implementation
         void BuildProviderDetail(int provider);
         void AddAccentColorRow(Microsoft::UI::Xaml::Controls::StackPanel const& parent,
             std::wstring const& key, std::wstring const& title);
+        void BuildAccountsCard(Microsoft::UI::Xaml::Controls::StackPanel const& parent, std::wstring const& providerKey);
+        winrt::Windows::Data::Json::JsonObject AccountProviders();
+        void AccountDraftChanged();
         void BuildPlacement();
         void BuildAbout();
         void BuildUpdate();
@@ -119,6 +122,10 @@ namespace winrt::SettingsUI::implementation
         winrt::Windows::Data::Json::JsonObject state_{ nullptr };
         winrt::Windows::Data::Json::JsonObject flightChanges_{ nullptr };
         winrt::Windows::Data::Json::JsonObject pendingChanges_{ nullptr };
+        winrt::Windows::Data::Json::JsonObject accountDraft_{ nullptr };
+        winrt::Windows::Data::Json::JsonObject accountFlightValue_{ nullptr };
+        winrt::Microsoft::UI::Xaml::Controls::StackPanel accountEditorHost_{ nullptr };
+        std::vector<std::wstring> expandedAccounts_;
         std::vector<winrt::Microsoft::UI::Xaml::Controls::ToggleSwitch> providerToggles_;
         std::vector<winrt::Microsoft::UI::Xaml::Controls::ContentControl> widgetDependentCards_;
         winrt::Microsoft::UI::Xaml::Controls::ToggleSwitch providerDetailEnableToggle_{ nullptr };

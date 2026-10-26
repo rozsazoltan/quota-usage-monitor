@@ -243,6 +243,7 @@ pub enum Key {
     MonitorDevice,
     AnchorLeft,
     SettingsPaneOpen,
+    AccountSettings,
 }
 
 #[derive(Clone, Debug, Deserialize)]

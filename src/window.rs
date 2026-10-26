@@ -141,6 +141,8 @@ struct AppState {
 
     widget_visible: bool,
     settings_pane_open: bool,
+    account_settings: crate::accounts::AccountSettings,
+    account_config_revision: u64,
 }
 
 #[cfg(debug_assertions)]
@@ -841,6 +843,10 @@ impl Appearance {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct SettingsFile {
+    #[serde(default = "schema_version_default")]
+    schema_version: u32,
+    #[serde(default = "legacy_account_settings")]
+    account_settings: crate::accounts::AccountSettings,
     #[serde(default)]
     tray_offset: i32,
     #[serde(default)]
@@ -896,6 +902,8 @@ struct SettingsFile {
 impl Default for SettingsFile {
     fn default() -> Self {
         Self {
+            schema_version: 1,
+            account_settings: crate::accounts::AccountSettings::legacy_automatic(),
             tray_offset: 0,
             anchor_left: false,
             taskbar_index: 0,
@@ -927,6 +935,14 @@ impl Default for SettingsFile {
 
 fn default_adaptive_refresh() -> bool {
     true
+}
+
+fn legacy_account_settings() -> crate::accounts::AccountSettings {
+    crate::accounts::AccountSettings::legacy_automatic()
+}
+
+fn schema_version_default() -> u32 {
+    1
 }
 
 fn default_poll_interval() -> u32 {
@@ -972,18 +988,33 @@ fn default_show_usage_window() -> bool {
 fn load_settings(claude_code_available: bool) -> SettingsFile {
     let current_path = settings_path();
     let legacy_paths = legacy_settings_paths();
-    let (settings, migrated) = load_settings_from_paths(
-        &current_path,
-        &legacy_paths[0],
-        &legacy_paths[1],
-    )
-        .unwrap_or_else(|| (SettingsFile::default(), false));
-    let settings = normalize_settings(settings);
+    let paths = settings_store::SettingsPaths {
+        current: settings_store::SettingsPath(current_path.clone()),
+        codex_legacy: settings_store::SettingsPath(legacy_paths[0].clone()),
+        claude_legacy: settings_store::SettingsPath(legacy_paths[1].clone()),
+    };
+    let result = settings_store::load(&paths, SettingsFile::default, decode_settings);
+    let (mut settings, migrated) = match result {
+        settings_store::LoadResult::Loaded(loaded) => {
+            let migrated = loaded.session.migration() == settings_store::MigrationState::Legacy;
+            let settings = loaded.session.baseline().clone();
+            *SETTINGS_SESSION.lock().unwrap_or_else(|e| e.into_inner()) = Some(loaded.session);
+            (settings, migrated)
+        }
+        settings_store::LoadResult::Failed(failure) => {
+            *SETTINGS_SESSION.lock().unwrap_or_else(|e| e.into_inner()) = None;
+            diagnose::log(format!("unable to load settings; writes disabled: {}", failure.error));
+            (failure.settings, false)
+        }
+    };
+    if migrated {
+        settings = normalize_persisted_settings(settings);
+    }
     let (settings, claude_auto_disabled) =
         apply_claude_code_availability(settings, claude_code_available);
     if migrated || claude_auto_disabled {
-        save_settings(&settings);
-        if migrated {
+        let saved = save_settings(&settings);
+        if migrated && saved {
             diagnose::log(format!("migrated legacy settings to {}", current_path.display()));
         }
         if claude_auto_disabled {
@@ -1007,6 +1038,42 @@ fn apply_claude_code_availability(
     (settings, disabled)
 }
 
+fn decode_settings(bytes: &[u8]) -> Result<settings_store::Decoded<SettingsFile>, String> {
+    let value: serde_json::Value = serde_json::from_slice(bytes).map_err(|e| e.to_string())?;
+    let object = value.as_object().ok_or("settings document must be an object")?;
+    match object.get("schema_version") {
+        None => {
+            if object.contains_key("account_settings") {
+                return Err("versionless settings cannot contain account_settings".into());
+            }
+            let mut settings: SettingsFile = serde_json::from_value(value).map_err(|e| e.to_string())?;
+            settings.schema_version = 1;
+            settings.account_settings = crate::accounts::AccountSettings::legacy_automatic();
+            settings = normalize_settings(settings);
+            Ok(settings_store::Decoded { value: settings, format: settings_store::SettingsFormat::Versionless })
+        }
+        Some(version) if version.as_u64() == Some(1) => {
+            if !object.contains_key("account_settings") {
+                return Err("schema version 1 requires account_settings".into());
+            }
+            let settings: SettingsFile = serde_json::from_value(value).map_err(|e| e.to_string())?;
+            settings.account_settings.validate_persisted()?;
+            Ok(settings_store::Decoded { value: settings, format: settings_store::SettingsFormat::Version1 })
+        }
+        Some(version) => Err(format!("unsupported settings schema_version: {version}")),
+    }
+}
+
+fn normalize_persisted_settings(mut settings: SettingsFile) -> SettingsFile {
+    for accounts in settings.account_settings.providers.values_mut() {
+        accounts.normalize();
+    }
+    settings = normalize_settings(settings);
+    settings.schema_version = 1;
+    settings
+}
+
+#[cfg(test)]
 fn load_settings_from_paths(
     current_path: &std::path::Path,
     codex_legacy_path: &std::path::Path,
@@ -1092,9 +1159,15 @@ fn normalize_settings(mut settings: SettingsFile) -> SettingsFile {
     settings
 }
 
-fn save_settings(settings: &SettingsFile) {
-    if let Err(error) = settings_store::save(&settings_path(), || Some(settings.clone())) {
-        diagnose::log_error("unable to save settings", error);
+static SETTINGS_SESSION: Mutex<Option<settings_store::Session<SettingsFile>>> = Mutex::new(None);
+
+fn save_settings(settings: &SettingsFile) -> bool {
+    match guarded_settings_save(settings_store::SaveIntent::Full, Some(settings)) {
+        Ok(()) => true,
+        Err(error) => {
+            diagnose::log_error("unable to save settings", error);
+            false
+        }
     }
 }
 
@@ -1115,46 +1188,56 @@ fn save_state_settings() {
 }
 
 fn persist_state_settings() -> Result<(), String> {
-    settings_store::save(&settings_path(), || {
-        let state = lock_state();
-        state.as_ref().map(|s| SettingsFile {
-            tray_offset: s.tray_offset,
-            anchor_left: s.anchor_left,
-            taskbar_index: if s.monitor_device.is_some() || s.legacy_selection_pending {
-                s.taskbar_index
-            } else {
-                0
-            },
-            monitor_device: s.monitor_device.clone(),
-            poll_interval_ms: s.poll_interval_ms,
-            adaptive_refresh: s.adaptive_refresh,
-            language: s
-                .language_override
-                .map(|language| language.code().to_string()),
-            appearance: s.appearance,
-            last_update_check_unix: s.last_update_check_unix,
-            widget_visible: s.widget_visible,
-            settings_pane_open: s.settings_pane_open,
-            show_tray_icon: s.show_tray_icon,
-            show_provider_icons: s.show_provider_icons,
-            show_claude_code: s.show_claude_code,
-            show_codex: s.show_codex,
-            show_antigravity: s.show_antigravity,
-            show_opencode: s.show_opencode,
-            show_cursor: s.show_cursor,
-            show_grok: s.show_grok,
-            show_copilot: s.show_copilot,
-            allow_unlimited_providers: s.allow_unlimited_providers,
-            show_session_window: s.show_session_window,
-            show_weekly_window: s.show_weekly_window,
-            alert_threshold_percent: s.alert_threshold_percent,
-            notified_quota_windows: s.notified_quota_windows.iter().cloned().collect(),
+    guarded_settings_save(settings_store::SaveIntent::Full, None)
+        .map_err(|error| {
+            diagnose::log_error("unable to save settings", &error);
+            format!("The setting was applied but could not be saved: {error}")
         })
-    })
-    .map_err(|error| {
-        diagnose::log_error("unable to save settings", &error);
-        format!("The setting was applied but could not be saved: {error}")
-    })
+}
+
+fn guarded_settings_save(
+    intent: settings_store::SaveIntent,
+    supplied: Option<&SettingsFile>,
+) -> Result<(), String> {
+    let mut session = SETTINGS_SESSION.lock().map_err(|_| "settings session lock poisoned".to_string())?;
+    let session = session.as_mut().ok_or_else(|| "settings writes are not authorized".to_string())?;
+    settings_store::save_guarded(session, intent, |baseline| {
+        if let Some(settings) = supplied {
+            let mut settings = settings.clone();
+            settings.account_settings = baseline.account_settings.clone();
+            return settings;
+        }
+        let state = lock_state();
+        let Some(s) = state.as_ref() else { return baseline.clone() };
+        let mut settings = baseline.clone();
+        settings.tray_offset = s.tray_offset;
+        settings.anchor_left = s.anchor_left;
+        settings.taskbar_index = if s.monitor_device.is_some() || s.legacy_selection_pending { s.taskbar_index } else { 0 };
+        settings.monitor_device = s.monitor_device.clone();
+        settings.poll_interval_ms = s.poll_interval_ms;
+        settings.adaptive_refresh = s.adaptive_refresh;
+        settings.language = s.language_override.map(|language| language.code().to_string());
+        settings.appearance = s.appearance;
+        settings.last_update_check_unix = s.last_update_check_unix;
+        settings.widget_visible = s.widget_visible;
+        settings.settings_pane_open = s.settings_pane_open;
+        settings.show_tray_icon = s.show_tray_icon;
+        settings.show_provider_icons = s.show_provider_icons;
+        settings.show_claude_code = s.show_claude_code;
+        settings.show_codex = s.show_codex;
+        settings.show_antigravity = s.show_antigravity;
+        settings.show_opencode = s.show_opencode;
+        settings.show_cursor = s.show_cursor;
+        settings.show_grok = s.show_grok;
+        settings.show_copilot = s.show_copilot;
+        settings.allow_unlimited_providers = s.allow_unlimited_providers;
+        settings.show_session_window = s.show_session_window;
+        settings.show_weekly_window = s.show_weekly_window;
+        settings.alert_threshold_percent = s.alert_threshold_percent;
+        settings.notified_quota_windows = s.notified_quota_windows.iter().cloned().collect();
+        settings.account_settings = s.account_settings.clone();
+        settings
+    }).map(|_| ()).map_err(|error| format!("{error:?}"))
 }
 
 thread_local! {
@@ -3345,6 +3428,7 @@ pub fn run() {
         let provider_availability = poller::provider_availability();
         let mut settings = load_settings(provider_availability.claude_code_available);
         if disable_unavailable_startup_providers(&mut settings, provider_availability) {
+            settings = normalize_settings(settings);
             save_settings(&settings);
         }
         let startup_monitors = native_interop::find_monitors();
@@ -3358,8 +3442,10 @@ pub fn run() {
             &startup_monitors,
             &startup_legacy_taskbar_devices,
         ) {
-            save_settings(&settings);
-            diagnose::log("migrated legacy taskbar index to a monitor device selection");
+            settings = normalize_settings(settings);
+            if save_settings(&settings) {
+                diagnose::log("migrated legacy taskbar index to a monitor device selection");
+            }
         }
         let legacy_selection_pending =
             settings.monitor_device.is_none() && settings.taskbar_index > 0;
@@ -3517,6 +3603,8 @@ pub fn run() {
                 drag_start_offset: 0,
                 widget_visible: settings.widget_visible,
                 settings_pane_open: settings.settings_pane_open,
+                account_settings: settings.account_settings.clone(),
+                account_config_revision: 0,
             });
         }
 
@@ -6169,6 +6257,7 @@ fn settings_snapshot() -> serde_json::Value {
     let preview = widget_preview_image_impl(&candidate, s.language, s.is_dark);
     let availability = effective_provider_availability(s);
     let snapshot = json!({
+        "account_settings": account_settings_wire(&s.account_settings, s.account_config_revision),
         "widget_preview_image":preview.as_ref().map(|image| image.0.as_str()),
         "widget_preview_width":preview.as_ref().map(|image| image.1),
         "widget_preview_height":preview.as_ref().map(|image| image.2),
@@ -6684,6 +6773,14 @@ fn handle_settings_requests(hwnd: HWND) {
             continue;
         }
         handled_request = true;
+        if matches!(pending.request.operation, Operation::Set { key: Key::AccountSettings, .. } | Operation::SetBatch { .. }) {
+            if let Some(result) = handle_account_settings_request(&pending.request.operation) {
+                let state = settings_snapshot();
+                let reply = settings_reply(pending.request.id, settings_ui::revision(), state, result);
+                let _ = pending.reply.try_send(reply);
+                continue;
+            }
+        }
         if let Operation::Preview { changes } = &pending.request.operation {
             // Drafts are read-only: no credential polling, publication, revision
             // increment, persistence, HWND operation or backend reconfiguration.
@@ -6730,6 +6827,7 @@ fn handle_settings_requests(hwnd: HWND) {
                 key: Key::SettingsPaneOpen,
                 value,
             } => setting_value(value).and_then(apply_settings_pane_open),
+            Operation::Set { key: Key::AccountSettings, .. } => unreachable!("account setting handled before availability refresh"),
             Operation::Set { key, value } => {
                 apply_settings_batch(hwnd, &[settings_ui::Change { key, value }])
             }
@@ -6764,6 +6862,134 @@ fn handle_settings_requests(hwnd: HWND) {
         refresh_settings_availability();
         publish_settings();
     }
+}
+
+fn handle_account_settings_request(operation: &Operation) -> Option<Result<(), SettingsApplyError>> {
+    let value = match operation {
+        Operation::Set { key: Key::AccountSettings, value } => value.clone(),
+        Operation::SetBatch { changes } if changes.iter().any(|c| c.key == Key::AccountSettings) => {
+            if changes.len() != 1 || changes[0].key != Key::AccountSettings {
+                return Some(Err(invalid_setting("Account settings must be the only change in a batch.")));
+            }
+            changes[0].value.clone()
+        }
+        _ => return None,
+    };
+    let revision_text = value.get("base_revision").and_then(serde_json::Value::as_str);
+    let base = revision_text.and_then(parse_canonical_revision);
+    let outcome = {
+        let mut state = lock_state();
+        let Some(state) = state.as_mut() else {
+            return Some(Err(SettingsApplyError::new("unavailable", "Widget is shutting down")));
+        };
+        if base != Some(state.account_config_revision) {
+            return Some(Err(SettingsApplyError::new("config_conflict", "Account settings changed elsewhere.")));
+        }
+        let wire: AccountSettingsWire = match serde_json::from_value(value) {
+            Ok(wire) => wire,
+            Err(error) => return Some(Err(invalid_setting(format!("Invalid account settings: {error}")))),
+        };
+        let candidate = match account_settings_from_wire(wire, &state.account_settings) {
+            Ok(value) => value,
+            Err(message) => return Some(Err(invalid_setting(message))),
+        };
+        if candidate == state.account_settings {
+            false
+        } else {
+            let Some(next_revision) = state.account_config_revision.checked_add(1) else {
+                return Some(Err(SettingsApplyError::new("config_conflict", "Account settings revision exhausted.")));
+            };
+            state.account_settings = candidate;
+            state.account_config_revision = next_revision;
+            true
+        }
+    };
+    Some(if outcome { persist_settings_request() } else { Ok(()) })
+}
+
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AccountSettingsWire {
+    base_revision: String,
+    providers: std::collections::BTreeMap<crate::providers::ProviderId, ProviderAccountsWire>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ProviderAccountsWire {
+    profiles: Vec<AccountProfileWire>,
+    default: String,
+    selected: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AccountProfileWire {
+    id: String,
+    name: String,
+    config_dir: Option<crate::accounts::CredentialReference>,
+    credentials: Option<crate::accounts::CredentialReference>,
+    enabled: bool,
+}
+
+fn parse_canonical_revision(value: &str) -> Option<u64> {
+    if value.is_empty() || (value.len() > 1 && value.starts_with('0')) || !value.bytes().all(|b| b.is_ascii_digit()) { return None; }
+    value.parse().ok()
+}
+
+fn account_settings_wire(settings: &crate::accounts::AccountSettings, revision: u64) -> serde_json::Value {
+    let providers: std::collections::BTreeMap<_, _> = settings.providers.iter().map(|(provider, accounts)| (
+        *provider,
+        ProviderAccountsWire {
+            profiles: accounts.profiles.iter().map(|profile| AccountProfileWire {
+                id: profile.id.as_str().to_owned(), name: profile.name.clone(),
+                config_dir: profile.config_dir.clone(), credentials: profile.credentials.clone(), enabled: profile.enabled,
+            }).collect(),
+            default: accounts.default.as_str().to_owned(),
+            selected: accounts.selected.as_ref().map(|id| id.as_str().to_owned()),
+        }
+    )).collect();
+    serde_json::to_value(AccountSettingsWire { base_revision: revision.to_string(), providers })
+        .expect("account settings wire DTO is serializable")
+}
+
+fn account_settings_from_wire(wire: AccountSettingsWire, existing: &crate::accounts::AccountSettings) -> Result<crate::accounts::AccountSettings, String> {
+    use crate::accounts::{AccountId, AccountProfile, ProviderAccounts};
+    if wire.providers.len() != 2 || !wire.providers.contains_key(&crate::providers::ProviderId::Claude) || !wire.providers.contains_key(&crate::providers::ProviderId::Codex) {
+        return Err("Complete Claude and Codex account settings are required".into());
+    }
+    let mut providers = std::collections::BTreeMap::new();
+    for (provider, accounts) in wire.providers {
+        if !matches!(provider, crate::providers::ProviderId::Claude | crate::providers::ProviderId::Codex) {
+            return Err(format!("Unsupported provider: {}", provider.key()));
+        }
+        let existing = existing.providers.get(&provider);
+        let mut used_ids = existing.map(|a| a.used_ids.clone()).unwrap_or_default();
+        let mut seen = std::collections::BTreeSet::new();
+        let mut profiles = Vec::new();
+        for profile in accounts.profiles {
+            let id = AccountId::new(profile.id)?;
+            let lower = id.as_str().to_ascii_lowercase();
+            if !seen.insert(lower.clone()) { return Err("Account IDs must be unique without regard to case".into()); }
+            if let Some(old) = existing.and_then(|a| a.profiles.iter().find(|p| p.id.as_str().eq_ignore_ascii_case(id.as_str()))) {
+                if old.id != id { return Err("Account ID spelling cannot change".into()); }
+            } else {
+                if used_ids.iter().any(|used| used.eq_ignore_ascii_case(&lower)) { return Err("Removed account IDs cannot be reused".into()); }
+                if profile.enabled { return Err("New account profiles must start disabled".into()); }
+            }
+            used_ids.insert(lower);
+            profiles.push(AccountProfile { id, name: profile.name, config_dir: profile.config_dir, credentials: profile.credentials, enabled: profile.enabled });
+        }
+        let default = AccountId::new(accounts.default)?;
+        let selected = accounts.selected.map(AccountId::new).transpose()?;
+        let value = ProviderAccounts { profiles, default, selected, used_ids };
+        let candidate = crate::accounts::AccountSettings { providers: [(provider, value.clone())].into_iter().collect() };
+        candidate.validate_persisted()?;
+        providers.insert(provider, value);
+    }
+    let value = crate::accounts::AccountSettings { providers };
+    value.validate_persisted()?;
+    Ok(value)
 }
 
 #[derive(Debug)]
@@ -6986,6 +7212,7 @@ fn validate_settings_changes_with_availability(
             Key::SettingsPaneOpen => {
                 candidate.settings_pane_open = setting_value(change.value.clone())?
             }
+            Key::AccountSettings => return Err(invalid_setting("Account settings must be set alone.")),
             Key::ShowTrayIcon => candidate.show_tray_icon = setting_value(change.value.clone())?,
             Key::ShowProviderIcons => {
                 candidate.show_provider_icons = setting_value(change.value.clone())?;
@@ -7592,32 +7819,20 @@ fn apply_settings_pane_open(open: bool) -> Result<(), SettingsApplyError> {
         app_state.settings_pane_open = open;
     }
 
-    let path = settings_path();
-    let snapshot_error = std::cell::RefCell::new(None::<std::io::Error>);
-    let saved = settings_store::save(&path, || {
-        let mut settings = match std::fs::read_to_string(&path) {
-            Ok(contents) => serde_json::from_str::<SettingsFile>(&contents).unwrap_or_default(),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                SettingsFile::default()
-            }
-            Err(error) => {
-                *snapshot_error.borrow_mut() = Some(error);
-                return None;
-            }
-        };
+    let mut session = SETTINGS_SESSION.lock().map_err(|_| {
+        SettingsApplyError::new("save_failed", "The settings session lock is poisoned")
+    })?;
+    let session = session.as_mut().ok_or_else(|| {
+        SettingsApplyError::new("save_failed", "Settings writes are not authorized")
+    })?;
+    settings_store::save_guarded(session, settings_store::SaveIntent::PaneOnly, |baseline| {
+        let mut settings = baseline.clone();
         settings.settings_pane_open = open;
-        Some(settings)
-    });
-    if let Some(error) = snapshot_error.into_inner() {
-        return Err(SettingsApplyError::new(
-            "save_failed",
-            format!("The navigation pane preference could not be saved: {error}"),
-        ));
-    }
-    saved.map_err(|error| {
+        settings
+    }).map(|_| ()).map_err(|error| {
         SettingsApplyError::new(
             "save_failed",
-            format!("The navigation pane preference could not be saved: {error}"),
+            format!("The navigation pane preference could not be saved: {error:?}"),
         )
     })
 }

@@ -25,6 +25,7 @@ using namespace Windows::Data::Json;
 namespace
 {
     std::wstring g_nativeLanguage{ L"en" };
+    int g_monitoringAccountProvider{ -1 };
     std::string Utf8(std::wstring const& value)
     {
         if (value.empty()) return {};
@@ -237,6 +238,8 @@ namespace
 
 namespace winrt::SettingsUI::implementation
 {
+    static JsonObject CloneJsonObject(JsonObject const& value);
+
     MainWindow::MainWindow()
     {
         InitializeComponent();
@@ -682,6 +685,26 @@ namespace winrt::SettingsUI::implementation
         if (stopping_ || inFlight_ != 0) return;
         if (HasPendingChanges())
         {
+            if (pendingChanges_.HasKey(L"account_settings"))
+            {
+                // The protocol accepts account settings only as a standalone change.
+                const auto revision = state_ ? state_.GetNamedObject(L"account_settings", JsonObject()).GetNamedString(L"base_revision", L"0") : hstring(L"0");
+                auto value = JsonObject();
+                value.Insert(L"base_revision", JsonValue::CreateStringValue(revision));
+                value.Insert(L"providers", CloneJsonObject(AccountProviders()));
+                pendingChanges_.Remove(L"account_settings");
+                if (pendingChanges_.Size() == 0) pendingChanges_ = nullptr;
+                flightChanges_ = nullptr;
+                accountFlightValue_ = value;
+                mutationInFlight_ = true;
+                UpdateSaveBar();
+                ShowMessage(L"Applying changes…");
+                auto request = Request(L"set");
+                request.Insert(L"key", JsonValue::CreateStringValue(L"account_settings"));
+                request.Insert(L"value", value);
+                Send(request);
+                return;
+            }
             auto server = state_ ? state_.GetNamedObject(L"settings", JsonObject()) : JsonObject();
             auto changes = JsonArray();
             auto snapshot = JsonObject();
@@ -689,15 +712,7 @@ namespace winrt::SettingsUI::implementation
             for (auto const& pair : pendingChanges_)
             {
                 const auto key = std::wstring(pair.Key().c_str());
-                const bool colorApplyPending = key == L"claude_accent" ? claudeColorApplyText_.has_value()
-                    : key == L"codex_accent" ? codexColorApplyText_.has_value()
-                    : key == L"antigravity_accent" ? antigravityColorApplyText_.has_value()
-                    : key == L"opencode_accent" ? opencodeColorApplyText_.has_value()
-                    : key == L"cursor_accent" ? cursorColorApplyText_.has_value()
-                    : key == L"grok_accent" ? grokColorApplyText_.has_value()
-                    : key == L"copilot_accent" ? copilotColorApplyText_.has_value()
-                    : key == L"usage_text_color" ? usageTextColorApplyText_.has_value() : false;
-                if ((!flightChanges_ || !flightChanges_.HasKey(key)) && !colorApplyPending &&
+                if ((!flightChanges_ || !flightChanges_.HasKey(key)) &&
                     server.HasKey(key) && server.GetNamedValue(key).Stringify() == pair.Value().Stringify()) continue;
                 if (changes.Size() == 20) { remainder.Insert(key, pair.Value()); continue; }
                 auto change = JsonObject(); change.Insert(L"key", JsonValue::CreateStringValue(key)); change.Insert(L"value", pair.Value()); changes.Append(change);
@@ -1117,6 +1132,12 @@ namespace winrt::SettingsUI::implementation
                 if (flightCopilotColorApplyText_) persistCopilotColorApplyText_ = flightCopilotColorApplyText_;
                 if (flightUsageTextColorApplyText_) persistUsageTextColorApplyText_ = flightUsageTextColorApplyText_;
                 ShowMessage(std::wstring(message.GetNamedString(L"error", L"Changes are active, but could not be saved.").c_str()), true);
+                if (accountFlightValue_)
+                {
+                    // The account value is live; Persist is the remaining retry.
+                    accountDraft_ = nullptr;
+                    accountFlightValue_ = nullptr;
+                }
             }
             else if (!ok)
             {
@@ -1137,6 +1158,13 @@ namespace winrt::SettingsUI::implementation
                 flightCopilotColorApplyText_.reset();
                 flightUsageTextColorApplyText_.reset();
                 ShowMessage(std::wstring(message.GetNamedString(L"error", L"The setting could not be applied.").c_str()), true);
+                if (accountFlightValue_)
+                {
+                    // Keep the user's draft (conflict or validation failure) and
+                    // rebase it on the revision in the returned state. No auto-retry.
+                    accountFlightValue_ = nullptr;
+                    AccountDraftChanged();
+                }
             }
             else
             {
@@ -1175,6 +1203,14 @@ namespace winrt::SettingsUI::implementation
                 persistCopilotColorApplyText_.reset();
                 persistUsageTextColorApplyText_.reset();
                 if (!isInitialGet) ShowMessage(L"Saved. Changes are now in effect.");
+                if (accountFlightValue_)
+                {
+                    const bool draftUnchanged = CloneJsonObject(AccountProviders()).Stringify() ==
+                        accountFlightValue_.GetNamedObject(L"providers").Stringify();
+                    accountFlightValue_ = nullptr;
+                    if (draftUnchanged) accountDraft_ = nullptr;
+                    else AccountDraftChanged();
+                }
             }
             flightChanges_ = nullptr;
         }
@@ -2247,6 +2283,7 @@ namespace winrt::SettingsUI::implementation
         appearancePresetColorInputs_.clear();
         widgetVisibilityToggle_ = nullptr;
         widgetDependentCards_.clear();
+        accountEditorHost_ = nullptr;
         UpdateWidgetPageAvailability();
         providerOrderGrid_ = nullptr;
         providerOrderOverlay_ = nullptr;
@@ -2452,32 +2489,110 @@ namespace winrt::SettingsUI::implementation
 
     void MainWindow::BuildMonitoring()
     {
+        if (g_monitoringAccountProvider == 0 || g_monitoringAccountProvider == 1)
+        {
+            const auto provider = g_monitoringAccountProvider;
+            const auto meta = ProviderAppearanceMeta()[static_cast<size_t>(provider)];
+            auto header = Card();
+            header.Background(Application::Current().Resources().Lookup(box_value(L"SolidBackgroundFillColorBaseBrush")).as<Media::Brush>());
+            auto titleRow = StackPanel(); titleRow.Orientation(Orientation::Horizontal); titleRow.Spacing(8);
+            titleRow.VerticalAlignment(VerticalAlignment::Center);
+            auto back = Button(); back.Content(SymbolIcon(Symbol::Back));
+            back.Background(nullptr); back.BorderBrush(nullptr); back.BorderThickness(Thickness{ 0 });
+            back.VerticalAlignment(VerticalAlignment::Center);
+            Microsoft::UI::Xaml::Automation::AutomationProperties::SetName(back, NativeLocalization::Translate(L"Back to providers", g_nativeLanguage));
+            Microsoft::UI::Xaml::Automation::AutomationProperties::SetAutomationId(back, L"ProviderDetailBack");
+            back.Click([this](auto const&, auto const&)
+            {
+                g_monitoringAccountProvider = -1;
+                RenderPage(L"Monitoring");
+                if (pageScroll_) pageScroll_.ScrollToVerticalOffset(0);
+            });
+            titleRow.Children().Append(back);
+            auto title = Label(meta.name + L" accounts", 19); title.VerticalAlignment(VerticalAlignment::Center);
+            titleRow.Children().Append(title);
+            header.Padding(Thickness{ 12, 6, 12, 6 });
+            header.Child(titleRow);
+            PageHost().Children().Append(header);
+            accountEditorHost_ = StackPanel();
+            PageHost().Children().Append(accountEditorHost_);
+            BuildAccountsCard(accountEditorHost_, provider == 0 ? L"claude" : L"codex");
+            return;
+        }
         auto providers=Card(); auto p=StackPanel(); p.Spacing(14); p.Children().Append(Label(L"Usage providers",19));
         providerToggles_.clear();
+        int providerIndex = 0;
         for (auto const& meta : ProviderAppearanceMeta())
         {
             const bool enabled = Bool(meta.enable);
             const bool available = state_ && state_.GetNamedBoolean(hstring(meta.availability), false);
-            auto copy=StackPanel(); copy.Spacing(3); copy.Children().Append(Label(meta.name));
+            const auto currentProviderIndex = providerIndex++;
+            auto copy=StackPanel(); copy.Spacing(3);
+            auto providerLabel = Label(meta.name);
+            Microsoft::UI::Xaml::Automation::AutomationProperties::SetName(providerLabel, meta.name);
+            Microsoft::UI::Xaml::Automation::AutomationProperties::SetAutomationId(providerLabel, std::wstring(L"ProviderLabel_") + meta.enable);
+            copy.Children().Append(providerLabel);
             auto description = Label(available ? meta.monitoringDetail : ProviderUnavailableDetail(meta, enabled), 12);
             description.Foreground(Application::Current().Resources().Lookup(box_value(L"TextFillColorSecondaryBrush")).as<Media::Brush>());
+            Microsoft::UI::Xaml::Automation::AutomationProperties::SetName(description, available ? meta.monitoringDetail : ProviderUnavailableDetail(meta, enabled));
+            Microsoft::UI::Xaml::Automation::AutomationProperties::SetAutomationId(description, std::wstring(L"ProviderDescription_") + meta.enable);
             copy.Children().Append(description);
             auto toggle=ToggleSwitch();
+            Button settings{ nullptr };
+            if (currentProviderIndex == 0 || currentProviderIndex == 1)
+            {
+                settings = Button();
+                settings.Content(box_value(NativeLocalization::Translate(L"Settings", g_nativeLanguage)));
+                settings.Background(nullptr);
+                settings.BorderThickness(Thickness{0, 0, 0, 0});
+                settings.Foreground(Application::Current().Resources().Lookup(box_value(L"AccentTextFillColorPrimaryBrush")).as<Media::Brush>());
+                settings.Padding(Thickness{4, 4, 4, 4});
+                settings.HorizontalAlignment(HorizontalAlignment::Left);
+                settings.Visibility(enabled ? Visibility::Visible : Visibility::Collapsed);
+                Microsoft::UI::Xaml::Automation::AutomationProperties::SetName(settings, NativeLocalization::Format(L"%s account settings", g_nativeLanguage, meta.name));
+                Microsoft::UI::Xaml::Automation::AutomationProperties::SetAutomationId(settings, std::wstring(L"ProviderSettings_") + meta.enable);
+                settings.Click([this, currentProviderIndex](auto const&, auto const&)
+                {
+                    g_monitoringAccountProvider = currentProviderIndex;
+                    RenderPage(L"Monitoring");
+                });
+            }
             Microsoft::UI::Xaml::Automation::AutomationProperties::SetName(toggle, meta.name);
             Microsoft::UI::Xaml::Automation::AutomationProperties::SetAutomationId(toggle, std::wstring(L"Setting_") + meta.enable);
             SetSwitchContent(toggle); toggle.IsOn(enabled); toggle.IsEnabled(available || enabled);
             const auto key = meta.enable;
             const auto availabilityKey = meta.availability;
-            toggle.Toggled([this, key, availabilityKey](auto const& sender, auto const&)
+            toggle.Toggled([this, key, availabilityKey, settings](auto const& sender, auto const&)
             {
                 auto control = sender.as<ToggleSwitch>();
                 const bool enabledNow = control.IsOn();
                 SetValue(key, JsonValue::CreateBooleanValue(enabledNow));
                 const bool availableNow = state_ && state_.GetNamedBoolean(hstring(availabilityKey), false);
                 control.IsEnabled(availableNow || enabledNow);
+                if (settings) settings.Visibility(enabledNow ? Visibility::Visible : Visibility::Collapsed);
             });
             providerToggles_.push_back(toggle);
-            p.Children().Append(ToggleRow(copy, toggle));
+            auto row = Grid();
+            auto columns = row.ColumnDefinitions();
+            columns.Append(ColumnDefinition());
+            columns.Append(ColumnDefinition());
+            columns.Append(ColumnDefinition());
+            columns.GetAt(1).Width(GridLengthHelper::Auto());
+            columns.GetAt(2).Width(GridLengthHelper::FromValueAndType(80, GridUnitType::Pixel));
+            row.HorizontalAlignment(HorizontalAlignment::Stretch);
+            copy.VerticalAlignment(VerticalAlignment::Center);
+            toggle.HorizontalAlignment(HorizontalAlignment::Right);
+            toggle.VerticalAlignment(VerticalAlignment::Center);
+            toggle.Margin(Thickness{12, 0, 0, 0});
+            row.Children().Append(copy);
+            Grid::SetColumn(toggle, 1);
+            row.Children().Append(toggle);
+            if (settings)
+            {
+                Grid::SetColumn(settings, 2);
+                row.Children().Append(settings);
+            }
+            p.Children().Append(row);
         }
         auto note=Label(L"At least one provider must stay enabled.",12);note.Foreground(Application::Current().Resources().Lookup(box_value(L"TextFillColorSecondaryBrush")).as<Media::Brush>());p.Children().Append(note);
         auto personalizeFooter = StackPanel(); personalizeFooter.Orientation(Orientation::Horizontal); personalizeFooter.Spacing(8);
@@ -2487,7 +2602,7 @@ namespace winrt::SettingsUI::implementation
          auto personalizeLink = HyperlinkButton(); personalizeLink.Content(box_value(NativeLocalization::Translate(L"Open Appearance settings", g_nativeLanguage)));
         personalizeLink.Click([this](auto const&, auto const&) { NavigateTo(L"Appearance"); });
         personalizeFooter.Children().Append(personalizeNote); personalizeFooter.Children().Append(personalizeLink);
-        p.Children().Append(personalizeFooter); providers.Child(p);PageHost().Children().Append(providers);
+         p.Children().Append(personalizeFooter); providers.Child(p);PageHost().Children().Append(providers);
         auto widgetCard = Card(); auto widgetSettings = StackPanel(); widgetSettings.Spacing(14);
         widgetSettings.Children().Append(Label(L"Widget contents", 19));
          widgetSettings.Children().Append(Label(L"Choose what appears in the taskbar widget. Keep at least one usage value visible; provider logos alone do not count.", 12));
@@ -2542,6 +2657,295 @@ namespace winrt::SettingsUI::implementation
         options.Child(o);PageHost().Children().Append(options);
     }
 
+    static JsonObject CloneJsonObject(JsonObject const& value)
+    {
+        return value ? JsonObject::Parse(value.Stringify()) : JsonObject();
+    }
+
+    static std::wstring OptionalString(JsonObject const& object, std::wstring const& key)
+    {
+        if (!object || !object.HasKey(hstring(key.c_str()))) return {};
+        auto value = object.GetNamedValue(hstring(key.c_str()));
+        return value.ValueType() == JsonValueType::String ? std::wstring(value.GetString().c_str()) : std::wstring();
+    }
+
+    static bool SameAccountId(std::wstring const& a, std::wstring const& b)
+    {
+        if (a.size() != b.size()) return false;
+        for (size_t i = 0; i < a.size(); ++i)
+            if (towlower(a[i]) != towlower(b[i])) return false;
+        return true;
+    }
+
+    static bool IsValidCredentialPath(std::wstring const& path)
+    {
+        if (path.empty() || path == L"~" || path.rfind(L"~/", 0) == 0 || path.rfind(L"~\\", 0) == 0) return true;
+        if (path.rfind(L"\\\\", 0) == 0) return true;
+        return path.size() >= 3 && path[1] == L':' && (path[2] == L'\\' || path[2] == L'/');
+    }
+
+    static int FindAccountProfile(JsonArray const& profiles, std::wstring const& id)
+    {
+        for (uint32_t i = 0; i < profiles.Size(); ++i)
+            if (SameAccountId(std::wstring(profiles.GetObjectAt(i).GetNamedString(L"id", L"").c_str()), id)) return static_cast<int>(i);
+        return -1;
+    }
+
+    JsonObject MainWindow::AccountProviders()
+    {
+        if (accountDraft_) return accountDraft_;
+        return state_ ? state_.GetNamedObject(L"account_settings", JsonObject()).GetNamedObject(L"providers", JsonObject()) : JsonObject();
+    }
+
+    void MainWindow::AccountDraftChanged()
+    {
+        if (!accountDraft_) return;
+        const auto revision = state_ ? state_.GetNamedObject(L"account_settings", JsonObject()).GetNamedString(L"base_revision", L"0") : hstring(L"0");
+        auto value = JsonObject();
+        value.Insert(L"base_revision", JsonValue::CreateStringValue(revision));
+        value.Insert(L"providers", CloneJsonObject(accountDraft_));
+        if (!pendingChanges_) pendingChanges_ = JsonObject();
+        pendingChanges_.Insert(L"account_settings", value);
+        flushRequested_ = false;
+        UpdateSaveBar();
+    }
+
+    static std::wstring SlugAccountId(std::wstring const& name)
+    {
+        std::wstring id;
+        for (const auto ch : name)
+        {
+            if (ch >= L'A' && ch <= L'Z') id.push_back(static_cast<wchar_t>(ch - L'A' + L'a'));
+            else if ((ch >= L'a' && ch <= L'z') || (ch >= L'0' && ch <= L'9')) id.push_back(ch);
+            else if (!id.empty() && id.back() != L'_') id.push_back(L'_');
+        }
+        while (!id.empty() && id.back() == L'_') id.pop_back();
+        if (id.empty()) id = L"account";
+        return id;
+    }
+
+    static std::wstring UniqueAccountId(JsonArray const& list, std::wstring const& base)
+    {
+        std::wstring candidate = base;
+        for (int suffix = 2; FindAccountProfile(list, candidate) >= 0; ++suffix)
+            candidate = base + L"_" + std::to_wstring(suffix);
+        return candidate;
+    }
+
+    static bool ContainsText(std::vector<std::wstring> const& items, std::wstring const& value)
+    {
+        for (auto const& item : items)
+            if (item == value) return true;
+        return false;
+    }
+
+    static void EraseText(std::vector<std::wstring>& items, std::wstring const& value)
+    {
+        for (auto it = items.begin(); it != items.end(); ++it)
+        {
+            if (*it == value) { items.erase(it); return; }
+        }
+    }
+
+    void MainWindow::BuildAccountsCard(StackPanel const& parent, std::wstring const& providerKey)
+    {
+        if (!parent) return;
+        parent.Children().Clear();
+        auto entry = AccountProviders().GetNamedObject(hstring(providerKey.c_str()), JsonObject());
+        auto profiles = entry.GetNamedArray(L"profiles", JsonArray());
+        const auto secondary = Application::Current().Resources().Lookup(box_value(L"TextFillColorSecondaryBrush")).as<Media::Brush>();
+        auto commit = [this, providerKey](JsonObject const& next)
+        {
+            accountDraft_ = next;
+            AccountDraftChanged();
+            if (accountEditorHost_) BuildAccountsCard(accountEditorHost_, providerKey);
+        };
+        auto card = Card();
+        card.Padding(Thickness{20, 18, 20, 18});
+        auto stack = StackPanel(); stack.Spacing(10);
+        auto title = Label(L"Accounts", 19); title.FontWeight(Windows::UI::Text::FontWeights::SemiBold());
+        stack.Children().Append(title);
+        auto note = Label(NativeLocalization::Translate(L"One account per provider is active. It reads the credential files the installed program already keeps; no secrets are stored here.", g_nativeLanguage), 12);
+        note.Foreground(secondary); note.TextWrapping(TextWrapping::Wrap); stack.Children().Append(note);
+        const auto defaultId = OptionalString(entry, L"default");
+        for (uint32_t i = 0; i < profiles.Size(); ++i)
+        {
+            auto profile = profiles.GetObjectAt(i);
+            const auto id = std::wstring(profile.GetNamedString(L"id", L""));
+            const auto name = OptionalString(profile, L"name");
+            const auto credentialsPath = OptionalString(profile, L"credentials");
+            const auto configDir = OptionalString(profile, L"config_dir");
+            const bool isActive = !defaultId.empty() && SameAccountId(defaultId, id);
+            const bool expanded = ContainsText(expandedAccounts_, id);
+            auto choice = RadioButton();
+            choice.GroupName(L"Accounts_" + providerKey);
+            choice.Content(box_value(hstring(name)));
+            choice.IsChecked(isActive);
+            choice.VerticalAlignment(VerticalAlignment::Center);
+            choice.MinHeight(40);
+            Microsoft::UI::Xaml::Automation::AutomationProperties::SetAutomationId(choice, L"AccountActive_" + providerKey + L"_" + id);
+            auto more = Button();
+            more.Content(box_value(hstring(NativeLocalization::Translate(L"Options", g_nativeLanguage))));
+            more.Padding(Thickness{ 8, 0, 8, 0 });
+            more.MinWidth(36);
+            more.MinHeight(36);
+            more.VerticalAlignment(VerticalAlignment::Center);
+            Microsoft::UI::Xaml::Automation::AutomationProperties::SetName(more, NativeLocalization::Translate(L"Account options", g_nativeLanguage));
+            Microsoft::UI::Xaml::Automation::AutomationProperties::SetAutomationId(more, L"AccountOptions_" + providerKey + L"_" + id);
+            auto headerRow = Grid();
+            auto headerColumns = headerRow.ColumnDefinitions(); headerColumns.Append(ColumnDefinition()); headerColumns.Append(ColumnDefinition());
+            headerColumns.GetAt(1).Width(GridLengthHelper::Auto());
+            headerRow.VerticalAlignment(VerticalAlignment::Center);
+            choice.HorizontalAlignment(HorizontalAlignment::Stretch);
+            headerRow.Children().Append(choice); Grid::SetColumn(more, 1); headerRow.Children().Append(more);
+            auto fields = StackPanel(); fields.Spacing(8);
+            fields.Margin(Thickness{ 14, 6, 10, 10 });
+            fields.Visibility(expanded ? Visibility::Visible : Visibility::Collapsed);
+            auto nameBox = TextBox(); nameBox.Text(hstring(name)); nameBox.MaxLength(80);
+            nameBox.Header(box_value(hstring(NativeLocalization::Translate(L"Name", g_nativeLanguage))));
+            Microsoft::UI::Xaml::Automation::AutomationProperties::SetAutomationId(nameBox, L"AccountName_" + providerKey + L"_" + id);
+            fields.Children().Append(nameBox);
+            auto credentialsBox = TextBox(); credentialsBox.Text(hstring(credentialsPath));
+            credentialsBox.Header(box_value(hstring(NativeLocalization::Translate(L"Credential file", g_nativeLanguage))));
+            credentialsBox.PlaceholderText(NativeLocalization::Translate(L"Default location", g_nativeLanguage));
+            Microsoft::UI::Xaml::Automation::AutomationProperties::SetAutomationId(credentialsBox, L"AccountCredentials_" + providerKey + L"_" + id);
+            fields.Children().Append(credentialsBox);
+            auto configBox = TextBox(); configBox.Text(hstring(configDir));
+            configBox.Header(box_value(hstring(NativeLocalization::Translate(L"Config folder (optional)", g_nativeLanguage))));
+            Microsoft::UI::Xaml::Automation::AutomationProperties::SetAutomationId(configBox, L"AccountConfigDir_" + providerKey + L"_" + id);
+            fields.Children().Append(configBox);
+            auto writeProfile = [this, providerKey, id, commit](std::wstring const& field, IJsonValue const& value)
+            {
+                auto next = CloneJsonObject(AccountProviders());
+                auto accounts = next.GetNamedObject(hstring(providerKey.c_str()), JsonObject());
+                auto list = accounts.GetNamedArray(L"profiles", JsonArray());
+                const auto index = FindAccountProfile(list, id);
+                if (index < 0) return;
+                list.GetObjectAt(static_cast<uint32_t>(index)).Insert(hstring(field.c_str()), value);
+                commit(next);
+            };
+            nameBox.LostFocus([this, nameBox, name, writeProfile](auto const&, auto const&)
+            {
+                if (hydrating_) return;
+                auto edited = std::wstring(nameBox.Text().c_str());
+                while (!edited.empty() && iswspace(edited.front())) edited.erase(edited.begin());
+                while (!edited.empty() && iswspace(edited.back())) edited.pop_back();
+                if (edited == name) return;
+                if (edited.empty()) { nameBox.Text(hstring(name)); ShowMessage(L"Enter a name for this account.", true); return; }
+                writeProfile(L"name", JsonValue::CreateStringValue(edited));
+            });
+            credentialsBox.LostFocus([this, credentialsBox, credentialsPath, writeProfile](auto const&, auto const&)
+            {
+                if (hydrating_) return;
+                auto edited = std::wstring(credentialsBox.Text().c_str());
+                if (edited == credentialsPath) return;
+                if (!IsValidCredentialPath(edited)) { credentialsBox.Text(hstring(credentialsPath)); ShowMessage(L"Use an absolute path, or a path starting with ~.", true); return; }
+                writeProfile(L"credentials", edited.empty() ? JsonValue::CreateNullValue() : JsonValue::CreateStringValue(edited));
+            });
+            configBox.LostFocus([this, configBox, configDir, writeProfile](auto const&, auto const&)
+            {
+                if (hydrating_) return;
+                auto edited = std::wstring(configBox.Text().c_str());
+                if (edited == configDir) return;
+                if (!IsValidCredentialPath(edited)) { configBox.Text(hstring(configDir)); ShowMessage(L"Use an absolute path, or a path starting with ~.", true); return; }
+                writeProfile(L"config_dir", edited.empty() ? JsonValue::CreateNullValue() : JsonValue::CreateStringValue(edited));
+            });
+            auto remove = Button();
+            remove.Content(box_value(hstring(NativeLocalization::Translate(L"Remove account", g_nativeLanguage))));
+            Microsoft::UI::Xaml::Automation::AutomationProperties::SetAutomationId(remove, L"AccountRemove_" + providerKey + L"_" + id);
+            remove.Click([this, providerKey, id, commit](auto const&, auto const&)
+            {
+                auto next = CloneJsonObject(AccountProviders());
+                auto accounts = next.GetNamedObject(hstring(providerKey.c_str()), JsonObject());
+                auto list = accounts.GetNamedArray(L"profiles", JsonArray());
+                const auto index = FindAccountProfile(list, id);
+                if (index < 0) return;
+                if (list.Size() <= 1)
+                {
+                    ShowMessage(L"Keep at least one account. Add another one before removing this.", true);
+                    return;
+                }
+                list.RemoveAt(static_cast<uint32_t>(index));
+                auto selected = OptionalString(accounts, L"selected");
+                if (!selected.empty() && SameAccountId(selected, id)) accounts.Insert(L"selected", JsonValue::CreateNullValue());
+                if (SameAccountId(OptionalString(accounts, L"default"), id))
+                {
+                    const auto replacementId = std::wstring(list.GetObjectAt(0).GetNamedString(L"id", L""));
+                    list.GetObjectAt(0).Insert(L"enabled", JsonValue::CreateBooleanValue(true));
+                    accounts.Insert(L"default", JsonValue::CreateStringValue(replacementId.c_str()));
+                    accounts.Insert(L"selected", JsonValue::CreateNullValue());
+                }
+                EraseText(expandedAccounts_, id);
+                commit(next);
+            });
+            remove.HorizontalAlignment(HorizontalAlignment::Left);
+            fields.Children().Append(remove);
+            more.Click([this, id, fields](auto const&, auto const&)
+            {
+                const bool visible = fields.Visibility() == Visibility::Visible;
+                const auto nextVisibility = visible ? Visibility::Collapsed : Visibility::Visible;
+                fields.Visibility(nextVisibility);
+                if (visible) EraseText(expandedAccounts_, id);
+                else if (!ContainsText(expandedAccounts_, id)) expandedAccounts_.push_back(id);
+            });
+            choice.Checked([this, providerKey, id, isActive, commit](auto const&, auto const&)
+            {
+                if (hydrating_ || isActive) return;
+                auto next = CloneJsonObject(AccountProviders());
+                auto accounts = next.GetNamedObject(hstring(providerKey.c_str()), JsonObject());
+                auto list = accounts.GetNamedArray(L"profiles", JsonArray());
+                const auto index = FindAccountProfile(list, id);
+                if (index < 0) return;
+                list.GetObjectAt(static_cast<uint32_t>(index)).Insert(L"enabled", JsonValue::CreateBooleanValue(true));
+                accounts.Insert(L"default", JsonValue::CreateStringValue(id.c_str()));
+                accounts.Insert(L"selected", JsonValue::CreateNullValue());
+                commit(next);
+            });
+            auto row = StackPanel(); row.Spacing(4); row.Margin(Thickness{ 0, 6, 0, 6 });
+            row.Children().Append(headerRow);
+            row.Children().Append(fields);
+            stack.Children().Append(row);
+        }
+        auto addPanel = StackPanel(); addPanel.Margin(Thickness{ 0, 12, 0, 0 });
+        auto addContent = StackPanel(); addContent.Spacing(6);
+        auto addLabel = Label(L"Add another account", 13); addLabel.FontWeight(Windows::UI::Text::FontWeights::SemiBold()); addContent.Children().Append(addLabel);
+        auto addRow = StackPanel(); addRow.Orientation(Orientation::Horizontal); addRow.Spacing(8);
+        addRow.VerticalAlignment(VerticalAlignment::Bottom);
+        addRow.SizeChanged([](auto const& sender, auto const&)
+        {
+            auto panel = sender.as<StackPanel>();
+            panel.Orientation(panel.ActualWidth() < 480 ? Orientation::Vertical : Orientation::Horizontal);
+        });
+        auto newName = TextBox(); newName.Width(240); newName.MaxLength(80);
+        newName.PlaceholderText(NativeLocalization::Translate(L"New account name", g_nativeLanguage));
+        Microsoft::UI::Xaml::Automation::AutomationProperties::SetAutomationId(newName, L"AccountNewName_" + providerKey);
+        auto add = Button(); add.Content(box_value(hstring(NativeLocalization::Translate(L"Add account", g_nativeLanguage))));
+        add.VerticalAlignment(VerticalAlignment::Bottom);
+        Microsoft::UI::Xaml::Automation::AutomationProperties::SetAutomationId(add, L"AccountAdd_" + providerKey);
+        add.Click([this, providerKey, newName, commit](auto const&, auto const&)
+        {
+            auto name = std::wstring(newName.Text().c_str());
+            while (!name.empty() && iswspace(name.front())) name.erase(name.begin());
+            while (!name.empty() && iswspace(name.back())) name.pop_back();
+            if (name.empty()) { ShowMessage(L"Enter a name for the new account.", true); return; }
+            auto next = CloneJsonObject(AccountProviders());
+            auto accounts = next.GetNamedObject(hstring(providerKey.c_str()), JsonObject());
+            auto list = accounts.GetNamedArray(L"profiles", JsonArray());
+            auto profile = JsonObject();
+            profile.Insert(L"id", JsonValue::CreateStringValue(UniqueAccountId(list, SlugAccountId(name)).c_str()));
+            profile.Insert(L"name", JsonValue::CreateStringValue(name.c_str()));
+            profile.Insert(L"config_dir", JsonValue::CreateNullValue());
+            profile.Insert(L"credentials", JsonValue::CreateNullValue());
+            profile.Insert(L"enabled", JsonValue::CreateBooleanValue(false));
+            list.Append(profile);
+            commit(next);
+            ShowMessage(L"Account added. Save, then choose it.");
+        });
+        addRow.Children().Append(newName); addRow.Children().Append(add);
+        addContent.Children().Append(addRow); addPanel.Children().Append(addContent);
+        stack.Children().Append(addPanel);
+        card.Child(stack); parent.Children().Append(card);
+    }
     void MainWindow::AddAccentColorRow(StackPanel const& parent, std::wstring const& key, std::wstring const& title)
     {
         const auto localizedTitle = NativeLocalization::Translate(title, g_nativeLanguage);
@@ -2573,17 +2977,21 @@ namespace winrt::SettingsUI::implementation
             else if (key == L"grok_accent") ++grokColorDraftRevision_;
             else if (key == L"copilot_accent") ++copilotColorDraftRevision_;
             else ++usageTextColorDraftRevision_;
-            if (key == L"claude_accent" && claudeColorApplyText_ && *claudeColorApplyText_ != text) claudeColorApplyText_.reset();
-            if (key == L"codex_accent" && codexColorApplyText_ && *codexColorApplyText_ != text) codexColorApplyText_.reset();
-            if (key == L"antigravity_accent" && antigravityColorApplyText_ && *antigravityColorApplyText_ != text) antigravityColorApplyText_.reset();
-            if (key == L"opencode_accent" && opencodeColorApplyText_ && *opencodeColorApplyText_ != text) opencodeColorApplyText_.reset();
-            if (key == L"cursor_accent" && cursorColorApplyText_ && *cursorColorApplyText_ != text) cursorColorApplyText_.reset();
-            if (key == L"grok_accent" && grokColorApplyText_ && *grokColorApplyText_ != text) grokColorApplyText_.reset();
-            if (key == L"copilot_accent" && copilotColorApplyText_ && *copilotColorApplyText_ != text) copilotColorApplyText_.reset();
-            if (key == L"usage_text_color" && usageTextColorApplyText_ && *usageTextColorApplyText_ != text) usageTextColorApplyText_.reset();
             SetColorDraft(key, text);
             if (key == L"usage_text_color" && ParseHexColor(text))
                 SetValue(L"provider_monochrome", JsonValue::CreateBooleanValue(false));
+            if (const auto color = ParseHexColor(text))
+            {
+                if (key == L"claude_accent") claudeColorApplyText_ = text;
+                else if (key == L"codex_accent") codexColorApplyText_ = text;
+                else if (key == L"antigravity_accent") antigravityColorApplyText_ = text;
+                else if (key == L"opencode_accent") opencodeColorApplyText_ = text;
+                else if (key == L"cursor_accent") cursorColorApplyText_ = text;
+                else if (key == L"grok_accent") grokColorApplyText_ = text;
+                else if (key == L"copilot_accent") copilotColorApplyText_ = text;
+                else usageTextColorApplyText_ = text;
+                auto value = JsonArray(); for (const auto component : *color) value.Append(JsonValue::CreateNumberValue(component)); SetValue(key, value);
+            }
             ScheduleWidgetPreview();
         });
 
@@ -2631,53 +3039,21 @@ namespace winrt::SettingsUI::implementation
             else if (key == L"copilot_accent") ++copilotColorDraftRevision_;
             else ++usageTextColorDraftRevision_;
             SetColorDraft(key, value);
+            if (key == L"claude_accent") claudeColorApplyText_ = value;
+            else if (key == L"codex_accent") codexColorApplyText_ = value;
+            else if (key == L"antigravity_accent") antigravityColorApplyText_ = value;
+            else if (key == L"opencode_accent") opencodeColorApplyText_ = value;
+            else if (key == L"cursor_accent") cursorColorApplyText_ = value;
+            else if (key == L"grok_accent") grokColorApplyText_ = value;
+            else if (key == L"copilot_accent") copilotColorApplyText_ = value;
+            else usageTextColorApplyText_ = value;
             if (key == L"usage_text_color") SetValue(L"provider_monochrome", JsonValue::CreateBooleanValue(false));
             ScheduleWidgetPreview(); flyout.Hide();
         });
         cancelColor.Click([flyout](auto const&, auto const&) { flyout.Hide(); });
 
-        auto apply = Button(); apply.Content(box_value(NativeLocalization::Translate(L"Apply color", g_nativeLanguage)));
-        Microsoft::UI::Xaml::Automation::AutomationProperties::SetAutomationId(apply, std::wstring(L"ApplyColor_") + key);
-        apply.Click([this, input, key](auto const&, auto const&)
-        {
-            const std::wstring raw(input.Text().c_str()); const auto color = ParseHexColor(raw);
-            if (!color) { SetColorDraft(key, raw); ShowMessage(L"Enter exactly # followed by six ASCII hexadecimal digits, for example #D97757.", true); return; }
-            const auto normalized = FormatHexColor(*color);
-            syncingColorText_ = true; input.Text(normalized); syncingColorText_ = false;
-            SetColorDraft(key, normalized);
-            if (key == L"usage_text_color") SetValue(L"provider_monochrome", JsonValue::CreateBooleanValue(false));
-            if (key == L"claude_accent") claudeColorApplyText_ = normalized;
-            else if (key == L"codex_accent") codexColorApplyText_ = normalized;
-            else if (key == L"antigravity_accent") antigravityColorApplyText_ = normalized;
-            else if (key == L"opencode_accent") opencodeColorApplyText_ = normalized;
-            else if (key == L"cursor_accent") cursorColorApplyText_ = normalized;
-            else if (key == L"grok_accent") grokColorApplyText_ = normalized;
-            else if (key == L"copilot_accent") copilotColorApplyText_ = normalized;
-            else usageTextColorApplyText_ = normalized;
-            auto value = JsonArray(); for (const auto component : *color) value.Append(JsonValue::CreateNumberValue(component)); SetValue(key, value);
-        });
-        auto discard = Button(); discard.Content(box_value(NativeLocalization::Translate(L"Discard", g_nativeLanguage)));
-        Microsoft::UI::Xaml::Automation::AutomationProperties::SetAutomationId(discard, std::wstring(L"DiscardColor_") + key);
-        discard.Click([this, input, key](auto const&, auto const&)
-        {
-            SetColorDraft(key, std::nullopt);
-            if (pendingChanges_ && pendingChanges_.HasKey(key)) { pendingChanges_.Remove(key); if (pendingChanges_.Size() == 0) pendingChanges_ = nullptr; }
-            if (key == L"claude_accent") claudeColorApplyText_.reset();
-            else if (key == L"codex_accent") codexColorApplyText_.reset();
-            else if (key == L"antigravity_accent") antigravityColorApplyText_.reset();
-            else if (key == L"opencode_accent") opencodeColorApplyText_.reset();
-            else if (key == L"cursor_accent") cursorColorApplyText_.reset();
-            else if (key == L"grok_accent") grokColorApplyText_.reset();
-            else if (key == L"copilot_accent") copilotColorApplyText_.reset();
-            else usageTextColorApplyText_.reset();
-            const bool wasHydrating = hydrating_.load(); hydrating_ = true;
-            syncingColorText_ = true; input.Text(StoredColorText(State(), key)); syncingColorText_ = false;
-            hydrating_ = wasHydrating; ScheduleWidgetPreview(); ShowMessage(L"Color draft discarded."); RefreshSettingsControlsIfSafe();
-        });
         input.IsEnabled(accentEnabled); pickerButton.IsEnabled(accentEnabled);
-        apply.IsEnabled(accentEnabled); discard.IsEnabled(accentEnabled);
         row.Children().Append(input); row.Children().Append(pickerButton);
-        row.Children().Append(apply); row.Children().Append(discard);
         if (key == L"usage_text_color")
         {
             auto monochrome = Button(); monochrome.Content(box_value(NativeLocalization::Translate(L"Monochrome", g_nativeLanguage)));
