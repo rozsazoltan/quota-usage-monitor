@@ -25,6 +25,7 @@ using namespace Windows::Data::Json;
 namespace
 {
     std::wstring g_nativeLanguage{ L"en" };
+    int g_monitoringAccountProvider{ -1 };
     std::string Utf8(std::wstring const& value)
     {
         if (value.empty()) return {};
@@ -2490,30 +2491,77 @@ namespace winrt::SettingsUI::implementation
     {
         auto providers=Card(); auto p=StackPanel(); p.Spacing(14); p.Children().Append(Label(L"Usage providers",19));
         providerToggles_.clear();
+        int providerIndex = 0;
         for (auto const& meta : ProviderAppearanceMeta())
         {
             const bool enabled = Bool(meta.enable);
             const bool available = state_ && state_.GetNamedBoolean(hstring(meta.availability), false);
-            auto copy=StackPanel(); copy.Spacing(3); copy.Children().Append(Label(meta.name));
+            const auto currentProviderIndex = providerIndex++;
+            auto copy=StackPanel(); copy.Spacing(3);
+            auto providerLabel = Label(meta.name);
+            Microsoft::UI::Xaml::Automation::AutomationProperties::SetName(providerLabel, meta.name);
+            Microsoft::UI::Xaml::Automation::AutomationProperties::SetAutomationId(providerLabel, std::wstring(L"ProviderLabel_") + meta.enable);
+            copy.Children().Append(providerLabel);
             auto description = Label(available ? meta.monitoringDetail : ProviderUnavailableDetail(meta, enabled), 12);
             description.Foreground(Application::Current().Resources().Lookup(box_value(L"TextFillColorSecondaryBrush")).as<Media::Brush>());
+            Microsoft::UI::Xaml::Automation::AutomationProperties::SetName(description, available ? meta.monitoringDetail : ProviderUnavailableDetail(meta, enabled));
+            Microsoft::UI::Xaml::Automation::AutomationProperties::SetAutomationId(description, std::wstring(L"ProviderDescription_") + meta.enable);
             copy.Children().Append(description);
             auto toggle=ToggleSwitch();
+            Button settings{ nullptr };
+            if (currentProviderIndex == 0 || currentProviderIndex == 1)
+            {
+                settings = Button();
+                settings.Content(box_value(NativeLocalization::Translate(L"Settings", g_nativeLanguage)));
+                settings.Background(nullptr);
+                settings.BorderThickness(Thickness{0, 0, 0, 0});
+                settings.Foreground(Application::Current().Resources().Lookup(box_value(L"AccentTextFillColorPrimaryBrush")).as<Media::Brush>());
+                settings.Padding(Thickness{12, 4, 4, 4});
+                settings.Visibility(enabled ? Visibility::Visible : Visibility::Collapsed);
+                Microsoft::UI::Xaml::Automation::AutomationProperties::SetName(settings, NativeLocalization::Format(L"%s account settings", g_nativeLanguage, meta.name));
+                Microsoft::UI::Xaml::Automation::AutomationProperties::SetAutomationId(settings, std::wstring(L"ProviderSettings_") + meta.enable);
+                settings.Click([this, currentProviderIndex](auto const&, auto const&)
+                {
+                    g_monitoringAccountProvider = currentProviderIndex;
+                    RenderPage(L"Monitoring");
+                });
+            }
             Microsoft::UI::Xaml::Automation::AutomationProperties::SetName(toggle, meta.name);
             Microsoft::UI::Xaml::Automation::AutomationProperties::SetAutomationId(toggle, std::wstring(L"Setting_") + meta.enable);
             SetSwitchContent(toggle); toggle.IsOn(enabled); toggle.IsEnabled(available || enabled);
             const auto key = meta.enable;
             const auto availabilityKey = meta.availability;
-            toggle.Toggled([this, key, availabilityKey](auto const& sender, auto const&)
+            toggle.Toggled([this, key, availabilityKey, settings](auto const& sender, auto const&)
             {
                 auto control = sender.as<ToggleSwitch>();
                 const bool enabledNow = control.IsOn();
                 SetValue(key, JsonValue::CreateBooleanValue(enabledNow));
                 const bool availableNow = state_ && state_.GetNamedBoolean(hstring(availabilityKey), false);
                 control.IsEnabled(availableNow || enabledNow);
+                if (settings) settings.Visibility(enabledNow ? Visibility::Visible : Visibility::Collapsed);
             });
             providerToggles_.push_back(toggle);
-            p.Children().Append(ToggleRow(copy, toggle));
+            auto row = Grid();
+            auto columns = row.ColumnDefinitions();
+            columns.Append(ColumnDefinition());
+            columns.Append(ColumnDefinition());
+            columns.Append(ColumnDefinition());
+            columns.GetAt(1).Width(GridLengthHelper::Auto());
+            columns.GetAt(2).Width(GridLengthHelper::Auto());
+            row.HorizontalAlignment(HorizontalAlignment::Stretch);
+            copy.VerticalAlignment(VerticalAlignment::Center);
+            toggle.HorizontalAlignment(HorizontalAlignment::Right);
+            toggle.VerticalAlignment(VerticalAlignment::Center);
+            toggle.Margin(Thickness{12, 0, 0, 0});
+            row.Children().Append(copy);
+            Grid::SetColumn(toggle, 1);
+            row.Children().Append(toggle);
+            if (settings)
+            {
+                Grid::SetColumn(settings, 2);
+                row.Children().Append(settings);
+            }
+            p.Children().Append(row);
         }
         auto note=Label(L"At least one provider must stay enabled.",12);note.Foreground(Application::Current().Resources().Lookup(box_value(L"TextFillColorSecondaryBrush")).as<Media::Brush>());p.Children().Append(note);
         auto personalizeFooter = StackPanel(); personalizeFooter.Orientation(Orientation::Horizontal); personalizeFooter.Spacing(8);
@@ -2523,7 +2571,13 @@ namespace winrt::SettingsUI::implementation
          auto personalizeLink = HyperlinkButton(); personalizeLink.Content(box_value(NativeLocalization::Translate(L"Open Appearance settings", g_nativeLanguage)));
         personalizeLink.Click([this](auto const&, auto const&) { NavigateTo(L"Appearance"); });
         personalizeFooter.Children().Append(personalizeNote); personalizeFooter.Children().Append(personalizeLink);
-        p.Children().Append(personalizeFooter); providers.Child(p);PageHost().Children().Append(providers);
+         p.Children().Append(personalizeFooter); providers.Child(p);PageHost().Children().Append(providers);
+        if (g_monitoringAccountProvider == 0 || g_monitoringAccountProvider == 1)
+        {
+            accountEditorHost_ = StackPanel();
+            PageHost().Children().Append(accountEditorHost_);
+            BuildAccountsCard(accountEditorHost_, g_monitoringAccountProvider == 0 ? L"claude" : L"codex");
+        }
         auto widgetCard = Card(); auto widgetSettings = StackPanel(); widgetSettings.Spacing(14);
         widgetSettings.Children().Append(Label(L"Widget contents", 19));
          widgetSettings.Children().Append(Label(L"Choose what appears in the taskbar widget. Keep at least one usage value visible; provider logos alone do not count.", 12));
@@ -2676,7 +2730,6 @@ namespace winrt::SettingsUI::implementation
         auto profiles = entry.GetNamedArray(L"profiles", JsonArray());
         const auto secondary = Application::Current().Resources().Lookup(box_value(L"TextFillColorSecondaryBrush")).as<Media::Brush>();
         const auto subtleFill = Application::Current().Resources().Lookup(box_value(L"SubtleFillColorSecondaryBrush")).as<Media::Brush>();
-        const auto accentFill = Application::Current().Resources().Lookup(box_value(L"AccentFillColorDefaultBrush")).as<Media::Brush>();
         auto commit = [this, providerKey](JsonObject const& next)
         {
             accountDraft_ = next;
@@ -2686,11 +2739,8 @@ namespace winrt::SettingsUI::implementation
         auto card = Card();
         card.Padding(Thickness{20, 18, 20, 18});
         auto stack = StackPanel(); stack.Spacing(10);
-        auto titleRow = StackPanel(); titleRow.Orientation(Orientation::Horizontal); titleRow.Spacing(8);
-        auto titleMark = Border(); titleMark.Width(3); titleMark.Height(20); titleMark.CornerRadius(CornerRadiusHelper::FromUniformRadius(2)); titleMark.Background(accentFill);
-        titleRow.Children().Append(titleMark);
-        auto title = Label(L"Accounts", 19); title.FontWeight(Windows::UI::Text::FontWeights::SemiBold()); titleRow.Children().Append(title);
-        stack.Children().Append(titleRow);
+        auto title = Label(L"Accounts", 19); title.FontWeight(Windows::UI::Text::FontWeights::SemiBold());
+        stack.Children().Append(title);
         auto note = Label(NativeLocalization::Translate(L"One account per provider is active. It reads the credential files the installed program already keeps; no secrets are stored here.", g_nativeLanguage), 12);
         note.Foreground(secondary); note.TextWrapping(TextWrapping::Wrap); stack.Children().Append(note);
         const auto defaultId = OptionalString(entry, L"default");
@@ -2835,11 +2885,8 @@ namespace winrt::SettingsUI::implementation
                 accounts.Insert(L"selected", JsonValue::CreateNullValue());
                 commit(next);
             });
-            auto activeMarker = Border(); activeMarker.Width(3); activeMarker.CornerRadius(CornerRadiusHelper::FromUniformRadius(2));
-            activeMarker.Background(isActive ? accentFill : subtleFill);
             auto rowGrid = Grid();
             auto rowCols = rowGrid.ColumnDefinitions(); rowCols.Append(ColumnDefinition()); rowCols.Append(ColumnDefinition()); rowCols.GetAt(0).Width(GridLengthHelper::Auto());
-            rowGrid.Children().Append(activeMarker);
             auto rowContent = StackPanel(); rowContent.Spacing(2); rowContent.Margin(Thickness{ 10, 4, 0, 4 });
             auto rowSurface = Border();
             rowSurface.Background(isActive ? subtleFill : Application::Current().Resources().Lookup(box_value(L"CardBackgroundFillColorDefaultBrush")).as<Media::Brush>());
@@ -3801,12 +3848,6 @@ namespace winrt::SettingsUI::implementation
         stack.Children().Append(ToggleRow(iconCopy, iconToggle));
         AddAccentColorRow(stack, meta.accent, NativeLocalization::Format(L"%s bar accent", g_nativeLanguage, meta.name));
         card.Child(stack); AppendWidgetDependentCard(card);
-        if (provider == 0 || provider == 1)
-        {
-            accountEditorHost_ = StackPanel();
-            PageHost().Children().Append(accountEditorHost_);
-            BuildAccountsCard(accountEditorHost_, provider == 0 ? L"claude" : L"codex");
-        }
     }
 
     void MainWindow::ClearStickyPreview()
