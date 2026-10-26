@@ -2675,6 +2675,8 @@ namespace winrt::SettingsUI::implementation
         auto entry = AccountProviders().GetNamedObject(hstring(providerKey.c_str()), JsonObject());
         auto profiles = entry.GetNamedArray(L"profiles", JsonArray());
         const auto secondary = Application::Current().Resources().Lookup(box_value(L"TextFillColorSecondaryBrush")).as<Media::Brush>();
+        const auto subtleFill = Application::Current().Resources().Lookup(box_value(L"SubtleFillColorSecondaryBrush")).as<Media::Brush>();
+        const auto accentFill = Application::Current().Resources().Lookup(box_value(L"AccentFillColorDefaultBrush")).as<Media::Brush>();
         auto commit = [this, providerKey](JsonObject const& next)
         {
             accountDraft_ = next;
@@ -2682,8 +2684,13 @@ namespace winrt::SettingsUI::implementation
             if (accountEditorHost_) BuildAccountsCard(accountEditorHost_, providerKey);
         };
         auto card = Card();
-        auto stack = StackPanel(); stack.Spacing(6);
-        stack.Children().Append(Label(L"Accounts", 19));
+        card.Padding(Thickness{20, 18, 20, 18});
+        auto stack = StackPanel(); stack.Spacing(10);
+        auto titleRow = StackPanel(); titleRow.Orientation(Orientation::Horizontal); titleRow.Spacing(8);
+        auto titleMark = Border(); titleMark.Width(3); titleMark.Height(20); titleMark.CornerRadius(CornerRadiusHelper::FromUniformRadius(2)); titleMark.Background(accentFill);
+        titleRow.Children().Append(titleMark);
+        auto title = Label(L"Accounts", 19); title.FontWeight(Windows::UI::Text::FontWeights::SemiBold()); titleRow.Children().Append(title);
+        stack.Children().Append(titleRow);
         auto note = Label(NativeLocalization::Translate(L"One account per provider is active. It reads the credential files the installed program already keeps; no secrets are stored here.", g_nativeLanguage), 12);
         note.Foreground(secondary); note.TextWrapping(TextWrapping::Wrap); stack.Children().Append(note);
         const auto defaultId = OptionalString(entry, L"default");
@@ -2701,19 +2708,24 @@ namespace winrt::SettingsUI::implementation
             choice.Content(box_value(hstring(name)));
             choice.IsChecked(isActive);
             choice.VerticalAlignment(VerticalAlignment::Center);
+            choice.MinHeight(40);
             Microsoft::UI::Xaml::Automation::AutomationProperties::SetAutomationId(choice, L"AccountActive_" + providerKey + L"_" + id);
             auto more = Button();
-            more.Content(box_value(L"\x2026"));
+            more.Content(box_value(hstring(NativeLocalization::Translate(L"Options", g_nativeLanguage))));
             more.Padding(Thickness{ 8, 0, 8, 0 });
-            more.MinWidth(32);
+            more.MinWidth(36);
+            more.MinHeight(36);
             more.VerticalAlignment(VerticalAlignment::Center);
             Microsoft::UI::Xaml::Automation::AutomationProperties::SetName(more, NativeLocalization::Translate(L"Account options", g_nativeLanguage));
             Microsoft::UI::Xaml::Automation::AutomationProperties::SetAutomationId(more, L"AccountOptions_" + providerKey + L"_" + id);
-            auto headerRow = StackPanel(); headerRow.Orientation(Orientation::Horizontal); headerRow.Spacing(4);
+            auto headerRow = Grid();
+            auto headerColumns = headerRow.ColumnDefinitions(); headerColumns.Append(ColumnDefinition()); headerColumns.Append(ColumnDefinition());
+            headerColumns.GetAt(1).Width(GridLengthHelper::Auto());
             headerRow.VerticalAlignment(VerticalAlignment::Center);
-            headerRow.Children().Append(choice); headerRow.Children().Append(more);
+            choice.HorizontalAlignment(HorizontalAlignment::Stretch);
+            headerRow.Children().Append(choice); Grid::SetColumn(more, 1); headerRow.Children().Append(more);
             auto fields = StackPanel(); fields.Spacing(8);
-            fields.Margin(Thickness{ 28, 4, 0, 6 });
+            fields.Margin(Thickness{ 14, 6, 10, 10 });
             fields.Visibility(expanded ? Visibility::Visible : Visibility::Collapsed);
             auto nameBox = TextBox(); nameBox.Text(hstring(name)); nameBox.MaxLength(80);
             nameBox.Header(box_value(hstring(NativeLocalization::Translate(L"Name", g_nativeLanguage))));
@@ -2792,11 +2804,21 @@ namespace winrt::SettingsUI::implementation
                 EraseText(expandedAccounts_, id);
                 commit(next);
             });
+            remove.HorizontalAlignment(HorizontalAlignment::Left);
             fields.Children().Append(remove);
-            more.Click([this, id, fields](auto const&, auto const&)
+            auto fieldsSurface = Border();
+            fieldsSurface.Background(subtleFill);
+            fieldsSurface.CornerRadius(CornerRadiusHelper::FromUniformRadius(8));
+            fieldsSurface.Padding(Thickness{ 12, 10, 12, 10 });
+            fieldsSurface.Margin(Thickness{ 10, 0, 0, 4 });
+            fieldsSurface.Child(fields);
+            fieldsSurface.Visibility(expanded ? Visibility::Visible : Visibility::Collapsed);
+            more.Click([this, id, fields, fieldsSurface](auto const&, auto const&)
             {
-                const bool visible = fields.Visibility() == Visibility::Visible;
-                fields.Visibility(visible ? Visibility::Collapsed : Visibility::Visible);
+                const bool visible = fieldsSurface.Visibility() == Visibility::Visible;
+                const auto nextVisibility = visible ? Visibility::Collapsed : Visibility::Visible;
+                fields.Visibility(nextVisibility);
+                fieldsSurface.Visibility(nextVisibility);
                 if (visible) EraseText(expandedAccounts_, id);
                 else if (!ContainsText(expandedAccounts_, id)) expandedAccounts_.push_back(id);
             });
@@ -2813,10 +2835,28 @@ namespace winrt::SettingsUI::implementation
                 accounts.Insert(L"selected", JsonValue::CreateNullValue());
                 commit(next);
             });
-            auto row = StackPanel(); row.Spacing(2); row.Padding(Thickness{ 0, 2, 0, 2 });
-            row.Children().Append(headerRow); row.Children().Append(fields);
-            stack.Children().Append(row);
+            auto activeMarker = Border(); activeMarker.Width(3); activeMarker.CornerRadius(CornerRadiusHelper::FromUniformRadius(2));
+            activeMarker.Background(isActive ? accentFill : subtleFill);
+            auto rowGrid = Grid();
+            auto rowCols = rowGrid.ColumnDefinitions(); rowCols.Append(ColumnDefinition()); rowCols.Append(ColumnDefinition()); rowCols.GetAt(0).Width(GridLengthHelper::Auto());
+            rowGrid.Children().Append(activeMarker);
+            auto rowContent = StackPanel(); rowContent.Spacing(2); rowContent.Margin(Thickness{ 10, 4, 0, 4 });
+            auto rowSurface = Border();
+            rowSurface.Background(isActive ? subtleFill : Application::Current().Resources().Lookup(box_value(L"CardBackgroundFillColorDefaultBrush")).as<Media::Brush>());
+            rowSurface.BorderBrush(Application::Current().Resources().Lookup(box_value(L"CardStrokeColorDefaultBrush")).as<Media::Brush>());
+            rowSurface.BorderThickness(Thickness{ 1, 1, 1, 1 });
+            rowSurface.CornerRadius(CornerRadiusHelper::FromUniformRadius(9));
+            rowSurface.Padding(Thickness{ 8, 4, 8, 4 });
+            rowSurface.Child(headerRow);
+            rowContent.Children().Append(rowSurface);
+            rowContent.Children().Append(fieldsSurface);
+            Grid::SetColumn(rowContent, 1); rowGrid.Children().Append(rowContent);
+            stack.Children().Append(rowGrid);
         }
+        auto addPanel = Border(); addPanel.Background(subtleFill); addPanel.CornerRadius(CornerRadiusHelper::FromUniformRadius(9));
+        addPanel.Padding(Thickness{ 12, 10, 12, 10 }); addPanel.Margin(Thickness{ 0, 4, 0, 0 });
+        auto addContent = StackPanel(); addContent.Spacing(6);
+        auto addLabel = Label(L"Add another account", 13); addLabel.FontWeight(Windows::UI::Text::FontWeights::SemiBold()); addContent.Children().Append(addLabel);
         auto addRow = StackPanel(); addRow.Orientation(Orientation::Horizontal); addRow.Spacing(8);
         addRow.VerticalAlignment(VerticalAlignment::Bottom);
         addRow.SizeChanged([](auto const& sender, auto const&)
@@ -2850,7 +2890,8 @@ namespace winrt::SettingsUI::implementation
             ShowMessage(L"Account added. Save, then choose it.");
         });
         addRow.Children().Append(newName); addRow.Children().Append(add);
-        stack.Children().Append(addRow);
+        addContent.Children().Append(addRow); addPanel.Child(addContent);
+        stack.Children().Append(addPanel);
         card.Child(stack); parent.Children().Append(card);
     }
     void MainWindow::AddAccentColorRow(StackPanel const& parent, std::wstring const& key, std::wstring const& title)
