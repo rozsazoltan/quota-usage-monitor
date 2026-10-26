@@ -2546,7 +2546,8 @@ namespace winrt::SettingsUI::implementation
                 settings.Background(nullptr);
                 settings.BorderThickness(Thickness{0, 0, 0, 0});
                 settings.Foreground(Application::Current().Resources().Lookup(box_value(L"AccentTextFillColorPrimaryBrush")).as<Media::Brush>());
-                settings.Padding(Thickness{12, 4, 4, 4});
+                settings.Padding(Thickness{4, 4, 4, 4});
+                settings.HorizontalAlignment(HorizontalAlignment::Left);
                 settings.Visibility(enabled ? Visibility::Visible : Visibility::Collapsed);
                 Microsoft::UI::Xaml::Automation::AutomationProperties::SetName(settings, NativeLocalization::Format(L"%s account settings", g_nativeLanguage, meta.name));
                 Microsoft::UI::Xaml::Automation::AutomationProperties::SetAutomationId(settings, std::wstring(L"ProviderSettings_") + meta.enable);
@@ -2577,7 +2578,7 @@ namespace winrt::SettingsUI::implementation
             columns.Append(ColumnDefinition());
             columns.Append(ColumnDefinition());
             columns.GetAt(1).Width(GridLengthHelper::Auto());
-            columns.GetAt(2).Width(GridLengthHelper::FromValueAndType(96, GridUnitType::Pixel));
+            columns.GetAt(2).Width(GridLengthHelper::FromValueAndType(80, GridUnitType::Pixel));
             row.HorizontalAlignment(HorizontalAlignment::Stretch);
             copy.VerticalAlignment(VerticalAlignment::Center);
             toggle.HorizontalAlignment(HorizontalAlignment::Right);
