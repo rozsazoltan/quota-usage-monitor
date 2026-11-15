@@ -3997,8 +3997,8 @@ fn render_layered_to(target: Option<HWND>) -> bool {
             }
         }
 
-        // Keep dimensions explicit, but preserve position established by SetWindowPos.
-        // UpdateLayeredWindow uses screen coordinates for non-null destinations.
+        // Keep dimensions explicit; child layered windows use a parent-client
+        // destination and reject NULL here.
         let Some(window_rect) = native_interop::get_window_rect_safe(hwnd) else {
             diagnose::log("widget layered surface update skipped: unable to query window rect");
             cleanup();
@@ -4010,7 +4010,7 @@ fn render_layered_to(target: Option<HWND>) -> bool {
         if diagnose::is_enabled() {
             let selected_bitmap = GetCurrentObject(mem_dc, OBJ_BITMAP);
             diagnose::log(format!(
-                "layered update inputs: hwnd={hwnd:?} parent={parent:?} screen_rect=({},{}-{},{}), parent_client_origin=({},{}), destination=NULL (preserve position), size={}x{}, rows=session:{show_session_window} weekly:{show_weekly_window}, hdc_dst=None hdc_src={mem_dc:?} gdi_flush={gdi_flush_succeeded} selected_bitmap={selected_bitmap:?} dib={dib:?} bitmap_selected={} bitmap_type={} style={:#x} exstyle={:#x}",
+                "layered update inputs: hwnd={hwnd:?} parent={parent:?} screen_rect=({},{}-{},{}), parent_client_origin=({},{}), destination=pt_dst (parent client), size={}x{}, rows=session:{show_session_window} weekly:{show_weekly_window}, hdc_dst=None hdc_src={mem_dc:?} gdi_flush={gdi_flush_succeeded} selected_bitmap={selected_bitmap:?} dib={dib:?} bitmap_selected={} bitmap_type={} style={:#x} exstyle={:#x}",
                 window_rect.left,
                 window_rect.top,
                 window_rect.right,
@@ -4040,7 +4040,7 @@ fn render_layered_to(target: Option<HWND>) -> bool {
         let rendered = UpdateLayeredWindow(
             hwnd,
             None,
-            None,
+            Some(&pt_dst),
             Some(&sz),
             mem_dc,
             Some(&pt_src),
