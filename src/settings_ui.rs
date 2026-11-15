@@ -338,6 +338,15 @@ pub fn revision() -> u64 {
     REVISION.load(Ordering::Relaxed)
 }
 
+/// Whether a settings companion is currently connected.
+pub fn is_open() -> bool {
+    SESSION
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_ref()
+        .is_some_and(|session| session.running.load(Ordering::Acquire))
+}
+
 pub fn publish(state: Value) {
     let revision = REVISION.fetch_add(1, Ordering::Relaxed) + 1;
     if let Some(session) = SESSION.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
