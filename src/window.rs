@@ -5331,6 +5331,9 @@ unsafe extern "system" fn wnd_proc(
                 TIMER_FRESHNESS => {
                     update_display();
                     render_layered();
+                    if settings_ui::is_open() && refresh_settings_availability() {
+                        publish_settings();
+                    }
                 }
                 TIMER_UPDATE_CHECK => {
                     begin_update_check(hwnd, false);
@@ -6667,11 +6670,15 @@ fn publish_settings() {
     settings_ui::publish(settings_snapshot());
 }
 
-fn refresh_settings_availability() {
+fn refresh_settings_availability() -> bool {
     let availability = poller::provider_availability();
-    if let Some(s) = lock_state().as_mut() {
-        s.provider_availability = availability;
-    }
+    let mut state = lock_state();
+    let Some(s) = state.as_mut() else {
+        return false;
+    };
+    let changed = s.provider_availability != availability;
+    s.provider_availability = availability;
+    changed
 }
 
 fn handle_settings_requests(hwnd: HWND) {

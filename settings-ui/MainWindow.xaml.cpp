@@ -138,6 +138,21 @@ namespace
     }
     bool SettingsChanged(JsonObject const& previous, JsonObject const& updated)
     {
+        constexpr std::array<const wchar_t*, 7> availabilityKeys{
+            L"claude_code_available",
+            L"codex_available",
+            L"antigravity_available",
+            L"opencode_available",
+            L"cursor_available",
+            L"grok_available",
+            L"copilot_available",
+        };
+        for (auto const key : availabilityKeys)
+        {
+            const bool wasAvailable = previous ? previous.GetNamedBoolean(key, false) : false;
+            const bool isAvailable = updated ? updated.GetNamedBoolean(key, false) : false;
+            if (wasAvailable != isAvailable) return true;
+        }
         const auto before = previous ? previous.GetNamedObject(L"settings", JsonObject()) : JsonObject();
         const auto after = updated ? updated.GetNamedObject(L"settings", JsonObject()) : JsonObject();
         if (before.Size() != after.Size()) return true;
