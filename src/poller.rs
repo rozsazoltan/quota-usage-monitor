@@ -641,6 +641,9 @@ fn all_known_credential_sources() -> Vec<CredentialSource> {
     for path in opencode_config_paths() {
         sources.push(CredentialSource::File(path));
     }
+    if let Some(path) = opencode_db_path() {
+        sources.push(CredentialSource::File(path));
+    }
     if let Some(path) = grok_auth_path() {
         sources.push(CredentialSource::File(path));
     }
@@ -1279,9 +1282,14 @@ struct OpenCodeDashboardConfig {
     auth_cookie: String,
 }
 
+enum OpenCodeAuth {
+    Cookie(String),
+    Bearer(String),
+}
+
 struct OpenCodeCredentials {
     workspace_id: String,
-    auth_cookie: String,
+    auth: OpenCodeAuth,
     source: String,
 }
 
@@ -1336,7 +1344,7 @@ struct OpenCodeDashboardUsage {
 
 fn poll_opencode() -> Result<UsageData, PollError> {
     let credentials = read_opencode_credentials().ok_or_else(|| {
-        diagnose::log("OpenCode usage poll failed: no dashboard credentials found".to_string());
+        diagnose::log("OpenCode usage poll failed: no credentials found".to_string());
         PollError::NoCredentials
     })?;
     let usage =
@@ -1391,7 +1399,7 @@ fn read_opencode_credentials() -> Option<OpenCodeCredentials> {
         if valid_opencode_workspace_id(&workspace_id) && valid_opencode_cookie(&auth_cookie) {
             return Some(OpenCodeCredentials {
                 workspace_id,
-                auth_cookie,
+                auth: OpenCodeAuth::Cookie(auth_cookie),
                 source: "environment".to_string(),
             });
         }
@@ -1400,6 +1408,7 @@ fn read_opencode_credentials() -> Option<OpenCodeCredentials> {
     opencode_config_paths()
         .into_iter()
         .find_map(|path| read_opencode_config(&path))
+        .or_else(read_opencode_native_credentials)
 }
 
 fn read_opencode_config(path: &PathBuf) -> Option<OpenCodeCredentials> {
@@ -1412,8 +1421,54 @@ fn read_opencode_config(path: &PathBuf) -> Option<OpenCodeCredentials> {
     }
     Some(OpenCodeCredentials {
         workspace_id,
-        auth_cookie,
+        auth: OpenCodeAuth::Cookie(auth_cookie),
         source: path.display().to_string(),
+    })
+}
+
+#[derive(Deserialize)]
+struct OpenCodeNativeMetadata {
+    #[serde(rename = "orgID", alias = "orgId")]
+    org_id: String,
+}
+
+#[derive(Deserialize)]
+struct OpenCodeNativeCredential {
+    access: String,
+    #[serde(default)]
+    expires: Option<i64>,
+    metadata: OpenCodeNativeMetadata,
+}
+
+fn read_opencode_native_credentials() -> Option<OpenCodeCredentials> {
+    let path = opencode_db_path()?;
+    let value = query_opencode_credential_value(&path).ok()??;
+    opencode_credentials_from_native_value(&value, &path.display().to_string())
+}
+
+fn opencode_credentials_from_native_value(
+    value: &str,
+    source: &str,
+) -> Option<OpenCodeCredentials> {
+    let credential: OpenCodeNativeCredential = serde_json::from_str(value).ok()?;
+    let workspace_id = credential.metadata.org_id.trim().to_string();
+    let access = credential.access.trim().to_string();
+    if !valid_opencode_workspace_id(&workspace_id) || !valid_opencode_cookie(&access) {
+        return None;
+    }
+    if let Some(expires) = credential.expires {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .ok()?
+            .as_millis() as i64;
+        if expires <= now {
+            return None;
+        }
+    }
+    Some(OpenCodeCredentials {
+        workspace_id,
+        auth: OpenCodeAuth::Bearer(access),
+        source: source.to_string(),
     })
 }
 
@@ -1422,25 +1477,31 @@ fn fetch_opencode_status(
     url: &str,
 ) -> Result<OpenCodeDashboardUsage, PollError> {
     let agent = build_agent()?;
-    let cookie = if credentials.auth_cookie.split(';').any(|part| {
-        let part = part.trim_start();
-        part.starts_with("auth=") || part.starts_with("__Host-console_session=")
-    }) {
-        credentials.auth_cookie.clone()
-    } else {
-        // Bare legacy auth values may contain '=' padding; that alone does
-        // not identify a complete Cookie header.
-        format!("auth={}", credentials.auth_cookie)
-    };
-
-    let resp = match agent
+    let mut request = agent
         .get(url)
         .set("Accept", "application/json")
         .set("x-org-id", &credentials.workspace_id)
-        .set("Cookie", &cookie)
-        .set("User-Agent", OPENCODE_GO_USER_AGENT)
-        .call()
-    {
+        .set("User-Agent", OPENCODE_GO_USER_AGENT);
+    match &credentials.auth {
+        OpenCodeAuth::Cookie(auth_cookie) => {
+            let cookie = if auth_cookie.split(';').any(|part| {
+                let part = part.trim_start();
+                part.starts_with("auth=") || part.starts_with("__Host-console_session=")
+            }) {
+                auth_cookie.clone()
+            } else {
+                // Bare legacy auth values may contain '=' padding; that alone does
+                // not identify a complete Cookie header.
+                format!("auth={auth_cookie}")
+            };
+            request = request.set("Cookie", &cookie);
+        }
+        OpenCodeAuth::Bearer(access) => {
+            request = request.set("Authorization", &format!("Bearer {access}"));
+        }
+    }
+
+    let resp = match request.call() {
         Ok(resp) => resp,
         Err(ureq::Error::Status(code, _)) if code == 401 || code == 403 => {
             return Err(PollError::AuthRequired)
@@ -1540,6 +1601,16 @@ fn opencode_config_paths() -> Vec<PathBuf> {
         );
     }
     paths
+}
+
+fn opencode_db_path() -> Option<PathBuf> {
+    if let Some(data) = opencode_non_empty_env("OPENCODE_DATA_DIR").map(PathBuf::from) {
+        return Some(data.join("opencode.db"));
+    }
+    if let Some(data) = opencode_non_empty_env("XDG_DATA_HOME").map(PathBuf::from) {
+        return Some(data.join("opencode").join("opencode.db"));
+    }
+    dirs::home_dir().map(|home| home.join(".local").join("share").join("opencode").join("opencode.db"))
 }
 
 fn opencode_non_empty_env(name: &str) -> Option<String> {
@@ -1757,13 +1828,31 @@ fn query_cursor_state_value_from_copy(path: &PathBuf, key: &str) -> Option<Strin
 }
 
 fn query_cursor_state_value(path: &PathBuf, key: &str) -> Result<Option<String>, String> {
+    query_text_value(path, "SELECT value FROM ItemTable WHERE key = ?1", Some(key))
+}
+
+fn query_opencode_credential_value(path: &PathBuf) -> Result<Option<String>, String> {
+    query_text_value(
+        path,
+        "SELECT value FROM credential WHERE integration_id = 'opencode' AND active = 1 LIMIT 1",
+        None,
+    )
+}
+
+fn query_text_value(
+    path: &PathBuf,
+    sql: &str,
+    key: Option<&str>,
+) -> Result<Option<String>, String> {
     let path_str = path
         .to_str()
         .ok_or_else(|| "state DB path is not valid Unicode".to_string())?;
     let path_c = CString::new(path_str).map_err(|error| error.to_string())?;
-    let sql_c =
-        CString::new("SELECT value FROM ItemTable WHERE key = ?1").map_err(|e| e.to_string())?;
-    let key_c = CString::new(key).map_err(|error| error.to_string())?;
+    let sql_c = CString::new(sql).map_err(|e| e.to_string())?;
+    let key_c = key
+        .map(CString::new)
+        .transpose()
+        .map_err(|error| error.to_string())?;
 
     unsafe {
         let mut db: *mut c_void = std::ptr::null_mut();
@@ -1788,12 +1877,14 @@ fn query_cursor_state_value(path: &PathBuf, key: &str) -> Result<Option<String>,
             return Err(format!("state DB prepare failed: {rc} ({detail})"));
         }
 
-        // SQLITE_TRANSIENT (-1): SQLite copies the bound text immediately.
-        let rc = sqlite3_bind_text(stmt, 1, key_c.as_ptr(), -1, (-1isize) as *const c_void);
-        if rc != SQLITE_OK {
-            sqlite3_finalize(stmt);
-            sqlite3_close_v2(db);
-            return Err(format!("state DB bind failed: {rc}"));
+        if let Some(key_c) = &key_c {
+            // SQLITE_TRANSIENT (-1): SQLite copies the bound text immediately.
+            let rc = sqlite3_bind_text(stmt, 1, key_c.as_ptr(), -1, (-1isize) as *const c_void);
+            if rc != SQLITE_OK {
+                sqlite3_finalize(stmt);
+                sqlite3_close_v2(db);
+                return Err(format!("state DB bind failed: {rc}"));
+            }
         }
 
         let value = match sqlite3_step(stmt) {
@@ -3386,6 +3477,22 @@ mod tests {
         body: &str,
         cookie: &str,
     ) -> (Result<OpenCodeDashboardUsage, PollError>, String) {
+        mock_opencode_status_request_with_auth(status, body, OpenCodeAuth::Cookie(cookie.into()))
+    }
+
+    fn mock_opencode_bearer_request(
+        status: u16,
+        body: &str,
+        access: &str,
+    ) -> (Result<OpenCodeDashboardUsage, PollError>, String) {
+        mock_opencode_status_request_with_auth(status, body, OpenCodeAuth::Bearer(access.into()))
+    }
+
+    fn mock_opencode_status_request_with_auth(
+        status: u16,
+        body: &str,
+        auth: OpenCodeAuth,
+    ) -> (Result<OpenCodeDashboardUsage, PollError>, String) {
         use std::io::{Read, Write};
         use std::net::TcpListener;
         use std::time::Duration;
@@ -3420,7 +3527,7 @@ mod tests {
         let result = fetch_opencode_status(
             &OpenCodeCredentials {
                 workspace_id: "wrk_example".into(),
-                auth_cookie: cookie.into(),
+                auth,
                 source: "test".into(),
             },
             &url,
@@ -3604,7 +3711,10 @@ mod tests {
         .unwrap();
         let credentials = read_opencode_config(&path).unwrap();
         assert_eq!(credentials.workspace_id, "wrk_01-test");
-        assert_eq!(credentials.auth_cookie, "auth=abc; theme=dark");
+        assert!(matches!(
+            credentials.auth,
+            OpenCodeAuth::Cookie(cookie) if cookie == "auth=abc; theme=dark"
+        ));
         std::fs::remove_file(&path).unwrap();
 
         assert!(!valid_opencode_workspace_id("../other"));
@@ -3612,6 +3722,56 @@ mod tests {
         assert!(valid_opencode_workspace_id("wrk_01-test"));
         assert!(!valid_opencode_cookie("auth=abc\r\nX-Test: injected"));
         assert!(!valid_opencode_cookie(""));
+    }
+
+    #[test]
+    fn opencode_request_uses_bearer_authorization_for_native_credentials() {
+        let (result, request) =
+            mock_opencode_bearer_request(200, OPENCODE_GO_STATUS_FIXTURE, "test-token");
+        assert_eq!(result.unwrap().rolling.unwrap().usage_percent, 12.5);
+        let request = request.to_ascii_lowercase();
+        assert!(request.starts_with("get /console/api/go/status http/1.1\r\n"));
+        assert!(request.contains("\r\nauthorization: bearer test-token\r\n"));
+        assert!(!request.contains("\r\ncookie:"));
+        assert!(request.contains("\r\nx-org-id: wrk_example\r\n"));
+    }
+
+    #[test]
+    fn opencode_native_credentials_use_bearer_and_org_id() {
+        let credentials = opencode_credentials_from_native_value(
+            r#"{
+                "type": "oauth",
+                "access": "access-token",
+                "refresh": "refresh-token",
+                "expires": 4102444800000,
+                "metadata": {
+                    "server": "https://opencode.ai/console",
+                    "orgID": "org_01TEST"
+                }
+            }"#,
+            "opencode.db",
+        )
+        .unwrap();
+        assert_eq!(credentials.workspace_id, "org_01TEST");
+        assert_eq!(credentials.source, "opencode.db");
+        assert!(matches!(
+            credentials.auth,
+            OpenCodeAuth::Bearer(token) if token == "access-token"
+        ));
+    }
+
+    #[test]
+    fn opencode_native_credentials_reject_expired_or_incomplete_values() {
+        for value in [
+            r#"{"access":"access-token","expires":0,"metadata":{"orgID":"org_01TEST"}}"#,
+            r#"{"access":"access-token","expires":4102444800000,"metadata":{}}"#,
+            r#"{"access":"","expires":4102444800000,"metadata":{"orgID":"org_01TEST"}}"#,
+        ] {
+            assert!(
+                opencode_credentials_from_native_value(value, "opencode.db").is_none(),
+                "{value}"
+            );
+        }
     }
 
     const CURSOR_USAGE_SUMMARY_FIXTURE: &str = r#"{
