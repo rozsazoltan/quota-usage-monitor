@@ -3,6 +3,7 @@
 
 use std::io::Write;
 
+mod accounts;
 mod diagnose;
 mod localization;
 mod models;
@@ -10,6 +11,7 @@ mod native_interop;
 mod poller;
 mod provider_icons;
 mod provider_poll;
+mod providers;
 mod quota_refresh;
 mod quota_text;
 mod quota_tooltip;
@@ -22,6 +24,8 @@ mod theme;
 mod tray_icon;
 mod uninstaller;
 mod updater;
+mod usage_adapter;
+mod usage_model;
 mod window;
 
 fn main() {
